@@ -20,19 +20,22 @@ use crate::azure::credential::*;
 use crate::client::pagination::stream_paginated;
 use crate::client::retry::RetryExt;
 use crate::path::DELIMITER;
-use crate::util::{format_http_range, format_prefix};
+use crate::util::{deserialize_rfc1123, format_http_range, format_prefix};
 use crate::{
     BoxStream, ClientOptions, ListResult, ObjectMeta, Path, Result, RetryConfig,
     StreamExt,
 };
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use bytes::{Buf, Bytes};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use itertools::Itertools;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::{
     header::{HeaderValue, CONTENT_LENGTH, IF_NONE_MATCH, RANGE},
     Client as ReqwestClient, Method, Response, StatusCode,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -205,6 +208,10 @@ impl AzureClient {
             builder = builder.header(&BLOB_TYPE, "BlockBlob").query(query);
         } else {
             builder = builder.query(query);
+        }
+
+        if let Some(value) = self.config().client_options.get_content_type(path) {
+            builder = builder.header(CONTENT_TYPE, value);
         }
 
         if let Some(bytes) = bytes {
@@ -405,9 +412,8 @@ impl TryFrom<ListResultInternal> for ListResult {
         let common_prefixes = value
             .blobs
             .blob_prefix
-            .unwrap_or_default()
             .into_iter()
-            .map(|x| Ok(Path::parse(&x.name)?))
+            .map(|x| Ok(Path::parse(x.name)?))
             .collect::<Result<_>>()?;
 
         let objects = value
@@ -432,7 +438,8 @@ impl TryFrom<ListResultInternal> for ListResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Blobs {
-    pub blob_prefix: Option<Vec<BlobPrefix>>,
+    #[serde(default)]
+    pub blob_prefix: Vec<BlobPrefix>,
     #[serde(rename = "Blob", default)]
     pub blobs: Vec<Blob>,
 }
@@ -474,7 +481,7 @@ impl TryFrom<Blob> for ObjectMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct BlobProperties {
-    #[serde(deserialize_with = "deserialize_http_date", rename = "Last-Modified")]
+    #[serde(deserialize_with = "deserialize_rfc1123", rename = "Last-Modified")]
     pub last_modified: DateTime<Utc>,
     pub etag: String,
     #[serde(rename = "Content-Length")]
@@ -485,16 +492,6 @@ struct BlobProperties {
     pub content_encoding: Option<String>,
     #[serde(rename = "Content-Language")]
     pub content_language: Option<String>,
-}
-
-// deserialize dates used in Azure payloads according to rfc1123
-fn deserialize_http_date<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    Utc.datetime_from_str(&s, RFC1123_FMT)
-        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,7 +530,7 @@ impl BlockList {
         for block_id in &self.blocks {
             let node = format!(
                 "\t<Uncommitted>{}</Uncommitted>\n",
-                base64::encode(block_id)
+                BASE64_STANDARD.encode(block_id)
             );
             s.push_str(&node);
         }

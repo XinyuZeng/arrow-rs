@@ -17,17 +17,14 @@
 
 //! Defines kernels suitable to perform operations to primitive arrays.
 
-use crate::array::{
-    Array, ArrayAccessor, ArrayData, ArrayIter, ArrayRef, BufferBuilder, DictionaryArray,
-    PrimitiveArray,
-};
-use crate::buffer::Buffer;
-use crate::datatypes::{ArrowNumericType, ArrowPrimitiveType};
-use crate::downcast_dictionary_array;
-use crate::error::{ArrowError, Result};
-use crate::util::bit_iterator::try_for_each_valid_idx;
-use arrow_buffer::MutableBuffer;
+use arrow_array::builder::BufferBuilder;
+use arrow_array::iterator::ArrayIter;
+use arrow_array::*;
+use arrow_buffer::{Buffer, MutableBuffer};
+use arrow_data::bit_iterator::try_for_each_valid_idx;
 use arrow_data::bit_mask::combine_option_bitmap;
+use arrow_data::ArrayData;
+use arrow_schema::ArrowError;
 use std::sync::Arc;
 
 #[inline]
@@ -71,11 +68,14 @@ where
 }
 
 /// See [`PrimitiveArray::try_unary`]
-pub fn try_unary<I, F, O>(array: &PrimitiveArray<I>, op: F) -> Result<PrimitiveArray<O>>
+pub fn try_unary<I, F, O>(
+    array: &PrimitiveArray<I>,
+    op: F,
+) -> Result<PrimitiveArray<O>, ArrowError>
 where
     I: ArrowPrimitiveType,
     O: ArrowPrimitiveType,
-    F: Fn(I::Native) -> Result<O::Native>,
+    F: Fn(I::Native) -> Result<O::Native, ArrowError>,
 {
     array.try_unary(op)
 }
@@ -84,19 +84,16 @@ where
 pub fn try_unary_mut<I, F>(
     array: PrimitiveArray<I>,
     op: F,
-) -> std::result::Result<
-    std::result::Result<PrimitiveArray<I>, ArrowError>,
-    PrimitiveArray<I>,
->
+) -> Result<Result<PrimitiveArray<I>, ArrowError>, PrimitiveArray<I>>
 where
     I: ArrowPrimitiveType,
-    F: Fn(I::Native) -> Result<I::Native>,
+    F: Fn(I::Native) -> Result<I::Native, ArrowError>,
 {
     array.try_unary_mut(op)
 }
 
 /// A helper function that applies an infallible unary function to a dictionary array with primitive value type.
-fn unary_dict<K, F, T>(array: &DictionaryArray<K>, op: F) -> Result<ArrayRef>
+fn unary_dict<K, F, T>(array: &DictionaryArray<K>, op: F) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowNumericType,
     T: ArrowPrimitiveType,
@@ -108,15 +105,19 @@ where
 }
 
 /// A helper function that applies a fallible unary function to a dictionary array with primitive value type.
-fn try_unary_dict<K, F, T>(array: &DictionaryArray<K>, op: F) -> Result<ArrayRef>
+fn try_unary_dict<K, F, T>(
+    array: &DictionaryArray<K>,
+    op: F,
+) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowNumericType,
     T: ArrowPrimitiveType,
-    F: Fn(T::Native) -> Result<T::Native>,
+    F: Fn(T::Native) -> Result<T::Native, ArrowError>,
 {
-    if array.value_type() != T::DATA_TYPE {
+    if !PrimitiveArray::<T>::is_compatible(&array.value_type()) {
         return Err(ArrowError::CastError(format!(
-            "Cannot perform the unary operation on dictionary array of value type {}",
+            "Cannot perform the unary operation of type {} on dictionary array of value type {}",
+            T::DATA_TYPE,
             array.value_type()
         )));
     }
@@ -127,7 +128,7 @@ where
 }
 
 /// Applies an infallible unary function to an array with primitive values.
-pub fn unary_dyn<F, T>(array: &dyn Array, op: F) -> Result<ArrayRef>
+pub fn unary_dyn<F, T>(array: &dyn Array, op: F) -> Result<ArrayRef, ArrowError>
 where
     T: ArrowPrimitiveType,
     F: Fn(T::Native) -> T::Native,
@@ -135,14 +136,15 @@ where
     downcast_dictionary_array! {
         array => unary_dict::<_, F, T>(array, op),
         t => {
-            if t == &T::DATA_TYPE {
+            if PrimitiveArray::<T>::is_compatible(t) {
                 Ok(Arc::new(unary::<T, F, T>(
                     array.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap(),
                     op,
                 )))
             } else {
                 Err(ArrowError::NotYetImplemented(format!(
-                    "Cannot perform unary operation on array of type {}",
+                    "Cannot perform unary operation of type {} on array of type {}",
+                    T::DATA_TYPE,
                     t
                 )))
             }
@@ -151,10 +153,10 @@ where
 }
 
 /// Applies a fallible unary function to an array with primitive values.
-pub fn try_unary_dyn<F, T>(array: &dyn Array, op: F) -> Result<ArrayRef>
+pub fn try_unary_dyn<F, T>(array: &dyn Array, op: F) -> Result<ArrayRef, ArrowError>
 where
     T: ArrowPrimitiveType,
-    F: Fn(T::Native) -> Result<T::Native>,
+    F: Fn(T::Native) -> Result<T::Native, ArrowError>,
 {
     downcast_dictionary_array! {
         array => if array.values().data_type() == &T::DATA_TYPE {
@@ -166,14 +168,15 @@ where
             )))
         },
         t => {
-            if t == &T::DATA_TYPE {
+            if PrimitiveArray::<T>::is_compatible(t) {
                 Ok(Arc::new(try_unary::<T, F, T>(
                     array.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap(),
                     op,
                 )?))
             } else {
                 Err(ArrowError::NotYetImplemented(format!(
-                    "Cannot perform unary operation on array of type {}",
+                    "Cannot perform unary operation of type {} on array of type {}",
+                    T::DATA_TYPE,
                     t
                 )))
             }
@@ -197,7 +200,7 @@ pub fn binary<A, B, F, O>(
     a: &PrimitiveArray<A>,
     b: &PrimitiveArray<B>,
     op: F,
-) -> Result<PrimitiveArray<O>>
+) -> Result<PrimitiveArray<O>, ArrowError>
 where
     A: ArrowPrimitiveType,
     B: ArrowPrimitiveType,
@@ -253,10 +256,7 @@ pub fn binary_mut<T, F>(
     a: PrimitiveArray<T>,
     b: &PrimitiveArray<T>,
     op: F,
-) -> std::result::Result<
-    std::result::Result<PrimitiveArray<T>, ArrowError>,
-    PrimitiveArray<T>,
->
+) -> Result<Result<PrimitiveArray<T>, ArrowError>, PrimitiveArray<T>>
 where
     T: ArrowPrimitiveType,
     F: Fn(T::Native, T::Native) -> T::Native,
@@ -315,10 +315,10 @@ pub fn try_binary<A: ArrayAccessor, B: ArrayAccessor, F, O>(
     a: A,
     b: B,
     op: F,
-) -> Result<PrimitiveArray<O>>
+) -> Result<PrimitiveArray<O>, ArrowError>
 where
     O: ArrowPrimitiveType,
-    F: Fn(A::Item, B::Item) -> Result<O::Native>,
+    F: Fn(A::Item, B::Item) -> Result<O::Native, ArrowError>,
 {
     if a.len() != b.len() {
         return Err(ArrowError::ComputeError(
@@ -377,13 +377,10 @@ pub fn try_binary_mut<T, F>(
     a: PrimitiveArray<T>,
     b: &PrimitiveArray<T>,
     op: F,
-) -> std::result::Result<
-    std::result::Result<PrimitiveArray<T>, ArrowError>,
-    PrimitiveArray<T>,
->
+) -> Result<Result<PrimitiveArray<T>, ArrowError>, PrimitiveArray<T>>
 where
     T: ArrowPrimitiveType,
-    F: Fn(T::Native, T::Native) -> Result<T::Native>,
+    F: Fn(T::Native, T::Native) -> Result<T::Native, ArrowError>,
 {
     if a.len() != b.len() {
         return Ok(Err(ArrowError::ComputeError(
@@ -442,10 +439,10 @@ fn try_binary_no_nulls<A: ArrayAccessor, B: ArrayAccessor, F, O>(
     a: A,
     b: B,
     op: F,
-) -> Result<PrimitiveArray<O>>
+) -> Result<PrimitiveArray<O>, ArrowError>
 where
     O: ArrowPrimitiveType,
-    F: Fn(A::Item, B::Item) -> Result<O::Native>,
+    F: Fn(A::Item, B::Item) -> Result<O::Native, ArrowError>,
 {
     let mut buffer = MutableBuffer::new(len * O::get_byte_width());
     for idx in 0..len {
@@ -463,13 +460,10 @@ fn try_binary_no_nulls_mut<T, F>(
     a: PrimitiveArray<T>,
     b: &PrimitiveArray<T>,
     op: F,
-) -> std::result::Result<
-    std::result::Result<PrimitiveArray<T>, ArrowError>,
-    PrimitiveArray<T>,
->
+) -> Result<Result<PrimitiveArray<T>, ArrowError>, PrimitiveArray<T>>
 where
     T: ArrowPrimitiveType,
-    F: Fn(T::Native, T::Native) -> Result<T::Native>,
+    F: Fn(T::Native, T::Native) -> Result<T::Native, ArrowError>,
 {
     let mut builder = a.into_builder()?;
     let slice = builder.values_slice_mut();
@@ -491,7 +485,7 @@ fn try_binary_opt_no_nulls<A: ArrayAccessor, B: ArrayAccessor, F, O>(
     a: A,
     b: B,
     op: F,
-) -> Result<PrimitiveArray<O>>
+) -> Result<PrimitiveArray<O>, ArrowError>
 where
     O: ArrowPrimitiveType,
     F: Fn(A::Item, B::Item) -> Option<O::Native>,
@@ -519,7 +513,7 @@ pub(crate) fn binary_opt<A: ArrayAccessor + Array, B: ArrayAccessor + Array, F, 
     a: A,
     b: B,
     op: F,
-) -> Result<PrimitiveArray<O>>
+) -> Result<PrimitiveArray<O>, ArrowError>
 where
     O: ArrowPrimitiveType,
     F: Fn(A::Item, B::Item) -> Option<O::Native>,
@@ -558,9 +552,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::array::{as_primitive_array, Float64Array, PrimitiveDictionaryBuilder};
-    use crate::datatypes::{Float64Type, Int32Type, Int8Type};
-    use arrow_array::Int32Array;
+    use arrow_array::builder::*;
+    use arrow_array::cast::*;
+    use arrow_array::types::*;
 
     #[test]
     fn test_unary_f64_slice() {

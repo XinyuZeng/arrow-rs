@@ -37,7 +37,7 @@ use arrow_schema::*;
 use crate::compression::CompressionCodec;
 use crate::CONTINUATION_MARKER;
 
-/// IPC write options used to control the behaviour of the writer
+/// IPC write options used to control the behaviour of the [`IpcDataGenerator`]
 #[derive(Debug, Clone)]
 pub struct IpcWriteOptions {
     /// Write padding after memory buffers to this multiple of bytes.
@@ -137,6 +137,38 @@ impl Default for IpcWriteOptions {
 }
 
 #[derive(Debug, Default)]
+/// Handles low level details of encoding [`Array`] and [`Schema`] into the
+/// [Arrow IPC Format].
+///
+/// # Example:
+/// ```
+/// # fn run() {
+/// # use std::sync::Arc;
+/// # use arrow_array::UInt64Array;
+/// # use arrow_array::RecordBatch;
+/// # use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+///
+/// // Create a record batch
+/// let batch = RecordBatch::try_from_iter(vec![
+///  ("col2", Arc::new(UInt64Array::from_iter([10, 23, 33])) as _)
+/// ]).unwrap();
+///
+/// // Error of dictionary ids are replaced.
+/// let error_on_replacement = true;
+/// let options = IpcWriteOptions::default();
+/// let mut dictionary_tracker = DictionaryTracker::new(error_on_replacement);
+///
+/// // encode the batch into zero or more encoded dictionaries
+/// // and the data for the actual array.
+/// let data_gen = IpcDataGenerator {};
+/// let (encoded_dictionaries, encoded_message) = data_gen
+///   .encoded_batch(&batch, &mut dictionary_tracker, &options)
+///   .unwrap();
+/// # }
+/// ```
+///
+/// [Arrow IPC Format]: https://arrow.apache.org/docs/format/Columnar.html#serialization-and-interprocess-communication-ipc
+
 pub struct IpcDataGenerator {}
 
 impl IpcDataGenerator {
@@ -316,6 +348,9 @@ impl IpcDataGenerator {
         Ok(())
     }
 
+    /// Encodes a batch to a number of [EncodedData] items (dictionary batches + the record batch).
+    /// The [DictionaryTracker] keeps track of dictionaries with new `dict_id`s  (so they are only sent once)
+    /// Make sure the [DictionaryTracker] is initialized at the start of the stream.
     pub fn encoded_batch(
         &self,
         batch: &RecordBatch,
@@ -511,6 +546,9 @@ pub struct DictionaryTracker {
 }
 
 impl DictionaryTracker {
+    /// Create a new [`DictionaryTracker`]. If `error_on_replacement`
+    /// is true, an error will be generated if an update to an
+    /// existing dictionary is attempted.
     pub fn new(error_on_replacement: bool) -> Self {
         Self {
             written: HashMap::new(),
@@ -537,10 +575,16 @@ impl DictionaryTracker {
 
         // If a dictionary with this id was already emitted, check if it was the same.
         if let Some(last) = self.written.get(&dict_id) {
-            if last.data().child_data()[0] == *dict_values {
+            if ArrayData::ptr_eq(&last.data().child_data()[0], dict_values) {
                 // Same dictionary values => no need to emit it again
                 return Ok(false);
-            } else if self.error_on_replacement {
+            }
+            if self.error_on_replacement {
+                // If error on replacement perform a logical comparison
+                if last.data().child_data()[0] == *dict_values {
+                    // Same dictionary values => no need to emit it again
+                    return Ok(false);
+                }
                 return Err(ArrowError::InvalidArgumentError(
                     "Dictionary replacement detected when writing IPC file format. \
                      Arrow IPC files only support a single dictionary for a given field \
@@ -1158,7 +1202,7 @@ fn write_array_data(
         )
     {
         // Truncate values
-        assert!(array_data.buffers().len() == 1);
+        assert_eq!(array_data.buffers().len(), 1);
 
         let buffer = &array_data.buffers()[0];
         let layout = layout(data_type);
@@ -1187,6 +1231,14 @@ fn write_array_data(
                 compression_codec,
             )?;
         }
+    } else if matches!(data_type, DataType::Boolean) {
+        // Bools are special because the payload (= 1 bit) is smaller than the physical container elements (= bytes).
+        // The array data may not start at the physical boundary of the underlying buffer, so we need to shift bits around.
+        assert_eq!(array_data.buffers().len(), 1);
+
+        let buffer = &array_data.buffers()[0];
+        let buffer = buffer.bit_slice(array_data.offset(), array_data.len());
+        offset = write_buffer(&buffer, buffers, arrow_data, offset, compression_codec)?;
     } else {
         for buffer in array_data.buffers() {
             offset =
@@ -1268,6 +1320,7 @@ fn pad_to_8(len: u32) -> usize {
 mod tests {
     use super::*;
 
+    use std::io::Cursor;
     use std::io::Seek;
     use std::sync::Arc;
 
@@ -1845,5 +1898,103 @@ mod tests {
 
         assert!(serialize(&record_batch).len() > serialize(&record_batch_slice).len());
         assert_eq!(record_batch_slice, deserialized_batch);
+    }
+
+    #[test]
+    fn test_stream_writer_writes_array_slice() {
+        let array = UInt32Array::from(vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(
+            vec![Some(1), Some(2), Some(3)],
+            array.iter().collect::<Vec<_>>()
+        );
+
+        let sliced = array.slice(1, 2);
+        let read_sliced: &UInt32Array = as_primitive_array(&sliced);
+        assert_eq!(
+            vec![Some(2), Some(3)],
+            read_sliced.iter().collect::<Vec<_>>()
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::UInt32, true)])),
+            vec![sliced],
+        )
+        .expect("new batch");
+
+        let mut writer =
+            StreamWriter::try_new(vec![], &batch.schema()).expect("new writer");
+        writer.write(&batch).expect("write");
+        let outbuf = writer.into_inner().expect("inner");
+
+        let mut reader = StreamReader::try_new(&outbuf[..], None).expect("new reader");
+        let read_batch = reader.next().unwrap().expect("read batch");
+
+        let read_array: &UInt32Array = as_primitive_array(read_batch.column(0));
+        assert_eq!(
+            vec![Some(2), Some(3)],
+            read_array.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn encode_bools_slice() {
+        // Test case for https://github.com/apache/arrow-rs/issues/3496
+        assert_bool_roundtrip([true, false], 1, 1);
+
+        // slice somewhere in the middle
+        assert_bool_roundtrip(
+            [
+                true, false, true, true, false, false, true, true, true, false, false,
+                false, true, true, true, true, false, false, false, false, true, true,
+                true, true, true, false, false, false, false, false,
+            ],
+            13,
+            17,
+        );
+
+        // start at byte boundary, end in the middle
+        assert_bool_roundtrip(
+            [
+                true, false, true, true, false, false, true, true, true, false, false,
+                false,
+            ],
+            8,
+            2,
+        );
+
+        // start and stop and byte boundary
+        assert_bool_roundtrip(
+            [
+                true, false, true, true, false, false, true, true, true, false, false,
+                false, true, true, true, true, true, false, false, false, false, false,
+            ],
+            8,
+            8,
+        );
+    }
+
+    fn assert_bool_roundtrip<const N: usize>(
+        bools: [bool; N],
+        offset: usize,
+        length: usize,
+    ) {
+        let val_bool_field = Field::new("val", DataType::Boolean, false);
+
+        let schema = Arc::new(Schema::new(vec![val_bool_field]));
+
+        let bools = BooleanArray::from(bools.to_vec());
+
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(bools)]).unwrap();
+        let batch = batch.slice(offset, length);
+
+        let mut writer = StreamWriter::try_new(Vec::<u8>::new(), &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+        let data = writer.into_inner().unwrap();
+
+        let mut reader = StreamReader::try_new(Cursor::new(data), None).unwrap();
+        let batch2 = reader.next().unwrap().unwrap();
+        assert_eq!(batch, batch2);
     }
 }

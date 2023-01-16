@@ -25,6 +25,216 @@ use arrow_select::take::take;
 use regex::Regex;
 use std::collections::HashMap;
 
+/// Helper function to perform boolean lambda function on values from two array accessors, this
+/// version does not attempt to use SIMD.
+///
+/// Duplicated from `arrow_ord::comparison`
+fn compare_op<T: ArrayAccessor, S: ArrayAccessor, F>(
+    left: T,
+    right: S,
+    op: F,
+) -> Result<BooleanArray, ArrowError>
+where
+    F: Fn(T::Item, S::Item) -> bool,
+{
+    if left.len() != right.len() {
+        return Err(ArrowError::ComputeError(
+            "Cannot perform comparison operation on arrays of different length"
+                .to_string(),
+        ));
+    }
+
+    Ok(BooleanArray::from_binary(left, right, op))
+}
+
+/// Helper function to perform boolean lambda function on values from array accessor, this
+/// version does not attempt to use SIMD.
+///
+/// Duplicated from `arrow_ord::comparison`
+fn compare_op_scalar<T: ArrayAccessor, F>(
+    left: T,
+    op: F,
+) -> Result<BooleanArray, ArrowError>
+where
+    F: Fn(T::Item) -> bool,
+{
+    Ok(BooleanArray::from_unary(left, op))
+}
+
+macro_rules! dyn_function {
+    ($sql:tt, $fn_name:tt, $fn_utf8:tt, $fn_dict:tt) => {
+#[doc = concat!("Perform SQL `", $sql ,"` operation on [`StringArray`] /")]
+/// [`LargeStringArray`], or [`DictionaryArray`] with values
+/// [`StringArray`]/[`LargeStringArray`].
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn $fn_name(left: &dyn Array, right: &dyn Array) -> Result<BooleanArray, ArrowError> {
+    match (left.data_type(), right.data_type()) {
+        (DataType::Utf8, DataType::Utf8)  => {
+            let left = as_string_array(left);
+            let right = as_string_array(right);
+            $fn_utf8(left, right)
+        }
+        (DataType::LargeUtf8, DataType::LargeUtf8) => {
+            let left = as_largestring_array(left);
+            let right = as_largestring_array(right);
+            $fn_utf8(left, right)
+        }
+        #[cfg(feature = "dyn_cmp_dict")]
+        (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
+            downcast_dictionary_array!(
+                left => {
+                    let right = as_dictionary_array(right);
+                    $fn_dict(left, right)
+                }
+                t => Err(ArrowError::ComputeError(format!(
+                    "Should be DictionaryArray but got: {}", t
+                )))
+            )
+        }
+        _ => {
+            Err(ArrowError::ComputeError(format!(
+                "{} only supports Utf8, LargeUtf8 or DictionaryArray (with feature `dyn_cmp_dict`) with Utf8 or LargeUtf8 values",
+                stringify!($fn_name)
+            )))
+        }
+    }
+}
+
+    }
+}
+dyn_function!("left LIKE right", like_dyn, like_utf8, like_dict);
+dyn_function!("left NOT LIKE right", nlike_dyn, nlike_utf8, nlike_dict);
+dyn_function!("left ILIKE right", ilike_dyn, ilike_utf8, ilike_dict);
+dyn_function!("left NOT ILIKE right", nilike_dyn, nilike_utf8, nilike_dict);
+dyn_function!(
+    "STARTSWITH(left, right)",
+    starts_with_dyn,
+    starts_with_utf8,
+    starts_with_dict
+);
+dyn_function!(
+    "ENDSWITH(left, right)",
+    ends_with_dyn,
+    ends_with_utf8,
+    ends_with_dict
+);
+dyn_function!(
+    "CONTAINS(left, right)",
+    contains_dyn,
+    contains_utf8,
+    contains_dict
+);
+
+macro_rules! scalar_dyn_function {
+    ($sql:tt, $fn_name:tt, $fn_scalar:tt) => {
+#[doc = concat!("Perform SQL `", $sql ,"` operation on [`StringArray`] /")]
+/// [`LargeStringArray`], or [`DictionaryArray`] with values
+/// [`StringArray`]/[`LargeStringArray`] and a scalar.
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn $fn_name(
+    left: &dyn Array,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    match left.data_type() {
+        DataType::Utf8 => {
+            let left = as_string_array(left);
+            $fn_scalar(left, right)
+        }
+        DataType::LargeUtf8 => {
+            let left = as_largestring_array(left);
+            $fn_scalar(left, right)
+        }
+        DataType::Dictionary(_, _) => {
+            downcast_dictionary_array!(
+                left => {
+                    let dict_comparison = $fn_name(left.values().as_ref(), right)?;
+                    // TODO: Use take_boolean (#2967)
+                    let array = take(&dict_comparison, left.keys(), None)?;
+                    Ok(BooleanArray::from(array.data().clone()))
+                }
+                t => Err(ArrowError::ComputeError(format!(
+                    "Should be DictionaryArray but got: {}", t
+                )))
+            )
+        }
+        _ => {
+            Err(ArrowError::ComputeError(format!(
+                "{} only supports Utf8, LargeUtf8 or DictionaryArray with Utf8 or LargeUtf8 values",
+                stringify!($fn_name)
+            )))
+        }
+    }
+}
+    }
+}
+scalar_dyn_function!("left LIKE right", like_utf8_scalar_dyn, like_scalar);
+scalar_dyn_function!("left NOT LIKE right", nlike_utf8_scalar_dyn, nlike_scalar);
+scalar_dyn_function!("left ILIKE right", ilike_utf8_scalar_dyn, ilike_scalar);
+scalar_dyn_function!(
+    "left NOT ILIKE right",
+    nilike_utf8_scalar_dyn,
+    nilike_scalar
+);
+scalar_dyn_function!(
+    "STARTSWITH(left, right)",
+    starts_with_utf8_scalar_dyn,
+    starts_with_scalar
+);
+scalar_dyn_function!(
+    "ENDSWITH(left, right)",
+    ends_with_utf8_scalar_dyn,
+    ends_with_scalar
+);
+scalar_dyn_function!(
+    "CONTAINS(left, right)",
+    contains_utf8_scalar_dyn,
+    contains_scalar
+);
+
+macro_rules! dict_function {
+    ($sql:tt, $fn_name:tt, $fn_impl:tt) => {
+
+#[doc = concat!("Perform SQL `", $sql ,"` operation on [`DictionaryArray`] with values")]
+/// [`StringArray`]/[`LargeStringArray`].
+///
+/// See the documentation on [`like_utf8`] for more details.
+#[cfg(feature = "dyn_cmp_dict")]
+fn $fn_name<K: ArrowPrimitiveType>(
+    left: &DictionaryArray<K>,
+    right: &DictionaryArray<K>,
+) -> Result<BooleanArray, ArrowError> {
+    match (left.value_type(), right.value_type()) {
+        (DataType::Utf8, DataType::Utf8) => {
+            let left = left.downcast_dict::<GenericStringArray<i32>>().unwrap();
+            let right = right.downcast_dict::<GenericStringArray<i32>>().unwrap();
+
+            $fn_impl(left, right)
+        }
+        (DataType::LargeUtf8, DataType::LargeUtf8) => {
+            let left = left.downcast_dict::<GenericStringArray<i64>>().unwrap();
+            let right = right.downcast_dict::<GenericStringArray<i64>>().unwrap();
+
+            $fn_impl(left, right)
+        }
+        _ => Err(ArrowError::ComputeError(format!(
+            "{} only supports DictionaryArray with Utf8 or LargeUtf8 values",
+            stringify!($fn_name)
+        ))),
+    }
+}
+    }
+}
+
+dict_function!("left LIKE right", like_dict, like);
+dict_function!("left NOT LIKE right", nlike_dict, nlike);
+dict_function!("left ILIKE right", ilike_dict, ilike);
+dict_function!("left NOT ILIKE right", nilike_dict, nilike);
+dict_function!("STARTSWITH(left, right)", starts_with_dict, starts_with);
+dict_function!("ENDSWITH(left, right)", ends_with_dict, ends_with);
+dict_function!("CONTAINS(left, right)", contains_dict, contains);
+
 /// Perform SQL `left LIKE right` operation on [`StringArray`] / [`LargeStringArray`].
 ///
 /// There are two wildcards supported with the LIKE operator:
@@ -47,6 +257,14 @@ pub fn like_utf8<OffsetSize: OffsetSizeTrait>(
     left: &GenericStringArray<OffsetSize>,
     right: &GenericStringArray<OffsetSize>,
 ) -> Result<BooleanArray, ArrowError> {
+    like(left, right)
+}
+
+#[inline]
+fn like<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
     regex_like(left, right, false, |re_pattern| {
         Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
@@ -55,86 +273,6 @@ pub fn like_utf8<OffsetSize: OffsetSizeTrait>(
             ))
         })
     })
-}
-
-/// Perform SQL `left LIKE right` operation on [`StringArray`] /
-/// [`LargeStringArray`], or [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`like_utf8`] for more details.
-pub fn like_dyn(left: &dyn Array, right: &dyn Array) -> Result<BooleanArray, ArrowError> {
-    match (left.data_type(), right.data_type()) {
-        (DataType::Utf8, DataType::Utf8)  => {
-            let left = as_string_array(left);
-            let right = as_string_array(right);
-            like_utf8(left, right)
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = as_largestring_array(left);
-            let right = as_largestring_array(right);
-            like_utf8(left, right)
-        }
-        #[cfg(feature = "dyn_cmp_dict")]
-        (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
-            downcast_dictionary_array!(
-                left => {
-                    let right = as_dictionary_array(right);
-                    like_dict(left, right)
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "like_dyn only supports Utf8, LargeUtf8 or DictionaryArray (with feature `dyn_cmp_dict`) with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
-}
-
-/// Perform SQL `left LIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`like_utf8`] for more details.
-#[cfg(feature = "dyn_cmp_dict")]
-fn like_dict<K: ArrowPrimitiveType>(
-    left: &DictionaryArray<K>,
-    right: &DictionaryArray<K>,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.value_type(), right.value_type()) {
-        (DataType::Utf8, DataType::Utf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i32>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i32>>().unwrap();
-
-            regex_like(left, right, false, |re_pattern| {
-                Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from LIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i64>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i64>>().unwrap();
-
-            regex_like(left, right, false, |re_pattern| {
-                Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from LIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        _ => Err(ArrowError::ComputeError(
-            "like_dict only supports DictionaryArray with Utf8 or LargeUtf8 values"
-                .to_string(),
-        )),
-    }
 }
 
 #[inline]
@@ -195,45 +333,6 @@ fn like_scalar<'a, L: ArrayAccessor<Item = &'a str>>(
 }
 
 /// Perform SQL `left LIKE right` operation on [`StringArray`] /
-/// [`LargeStringArray`], or [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`] and a scalar.
-///
-/// See the documentation on [`like_utf8`] for more details.
-pub fn like_utf8_scalar_dyn(
-    left: &dyn Array,
-    right: &str,
-) -> Result<BooleanArray, ArrowError> {
-    match left.data_type() {
-        DataType::Utf8 => {
-            let left = as_string_array(left);
-            like_scalar(left, right)
-        }
-        DataType::LargeUtf8 => {
-            let left = as_largestring_array(left);
-            like_scalar(left, right)
-        }
-        DataType::Dictionary(_, _) => {
-            downcast_dictionary_array!(
-                left => {
-                    let dict_comparison = like_utf8_scalar_dyn(left.values().as_ref(), right)?;
-                    // TODO: Use take_boolean (#2967)
-                    let array = take(&dict_comparison, left.keys(), None)?;
-                    Ok(BooleanArray::from(array.data().clone()))
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "like_utf8_scalar_dyn only supports Utf8, LargeUtf8 or DictionaryArray with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
-}
-
-/// Perform SQL `left LIKE right` operation on [`StringArray`] /
 /// [`LargeStringArray`] and a scalar.
 ///
 /// See the documentation on [`like_utf8`] for more details.
@@ -289,6 +388,14 @@ pub fn nlike_utf8<OffsetSize: OffsetSizeTrait>(
     left: &GenericStringArray<OffsetSize>,
     right: &GenericStringArray<OffsetSize>,
 ) -> Result<BooleanArray, ArrowError> {
+    nlike(left, right)
+}
+
+#[inline]
+fn nlike<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
     regex_like(left, right, true, |re_pattern| {
         Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
@@ -299,133 +406,12 @@ pub fn nlike_utf8<OffsetSize: OffsetSizeTrait>(
     })
 }
 
-/// Perform SQL `left NOT LIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`like_utf8`] for more details.
-pub fn nlike_dyn(
-    left: &dyn Array,
-    right: &dyn Array,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.data_type(), right.data_type()) {
-        (DataType::Utf8, DataType::Utf8)  => {
-            let left = as_string_array(left);
-            let right = as_string_array(right);
-            nlike_utf8(left, right)
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = as_largestring_array(left);
-            let right = as_largestring_array(right);
-            nlike_utf8(left, right)
-        }
-        #[cfg(feature = "dyn_cmp_dict")]
-        (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
-            downcast_dictionary_array!(
-                left => {
-                    let right = as_dictionary_array(right);
-                    nlike_dict(left, right)
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "nlike_dyn only supports Utf8, LargeUtf8 or DictionaryArray (with feature `dyn_cmp_dict`) with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
-}
-
-/// Perform SQL `left NOT LIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`like_utf8`] for more details.
-#[cfg(feature = "dyn_cmp_dict")]
-fn nlike_dict<K: ArrowPrimitiveType>(
-    left: &DictionaryArray<K>,
-    right: &DictionaryArray<K>,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.value_type(), right.value_type()) {
-        (DataType::Utf8, DataType::Utf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i32>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i32>>().unwrap();
-
-            regex_like(left, right, true, |re_pattern| {
-                Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from LIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i64>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i64>>().unwrap();
-
-            regex_like(left, right, true, |re_pattern| {
-                Regex::new(&format!("^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from LIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        _ => Err(ArrowError::ComputeError(
-            "nlike_dict only supports DictionaryArray with Utf8 or LargeUtf8 values"
-                .to_string(),
-        )),
-    }
-}
-
 #[inline]
 fn nlike_scalar<'a, L: ArrayAccessor<Item = &'a str>>(
     left: L,
     right: &str,
 ) -> Result<BooleanArray, ArrowError> {
     like_scalar_op(left, right, |x| !x)
-}
-
-/// Perform SQL `left NOT LIKE right` operation on [`StringArray`] /
-/// [`LargeStringArray`], or [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`] and a scalar.
-///
-/// See the documentation on [`like_utf8`] for more details.
-pub fn nlike_utf8_scalar_dyn(
-    left: &dyn Array,
-    right: &str,
-) -> Result<BooleanArray, ArrowError> {
-    match left.data_type() {
-        DataType::Utf8 => {
-            let left = as_string_array(left);
-            nlike_scalar(left, right)
-        }
-        DataType::LargeUtf8 => {
-            let left = as_largestring_array(left);
-            nlike_scalar(left, right)
-        }
-        DataType::Dictionary(_, _) => {
-            downcast_dictionary_array!(
-                left => {
-                    let dict_comparison = nlike_utf8_scalar_dyn(left.values().as_ref(), right)?;
-                    // TODO: Use take_boolean (#2967)
-                    let array = take(&dict_comparison, left.keys(), None)?;
-                    Ok(BooleanArray::from(array.data().clone()))
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "nlike_utf8_scalar_dyn only supports Utf8, LargeUtf8 or DictionaryArray with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
 }
 
 /// Perform SQL `left NOT LIKE right` operation on [`StringArray`] /
@@ -450,6 +436,14 @@ pub fn ilike_utf8<OffsetSize: OffsetSizeTrait>(
     left: &GenericStringArray<OffsetSize>,
     right: &GenericStringArray<OffsetSize>,
 ) -> Result<BooleanArray, ArrowError> {
+    ilike(left, right)
+}
+
+#[inline]
+fn ilike<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
     regex_like(left, right, false, |re_pattern| {
         Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
@@ -458,88 +452,6 @@ pub fn ilike_utf8<OffsetSize: OffsetSizeTrait>(
             ))
         })
     })
-}
-
-/// Perform SQL `left ILIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`like_utf8`] for more details.
-pub fn ilike_dyn(
-    left: &dyn Array,
-    right: &dyn Array,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.data_type(), right.data_type()) {
-        (DataType::Utf8, DataType::Utf8)  => {
-            let left = as_string_array(left);
-            let right = as_string_array(right);
-            ilike_utf8(left, right)
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = as_largestring_array(left);
-            let right = as_largestring_array(right);
-            ilike_utf8(left, right)
-        }
-        #[cfg(feature = "dyn_cmp_dict")]
-        (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
-            downcast_dictionary_array!(
-                left => {
-                    let right = as_dictionary_array(right);
-                    ilike_dict(left, right)
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "ilike_dyn only supports Utf8, LargeUtf8 or DictionaryArray (with feature `dyn_cmp_dict`) with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
-}
-
-/// Perform SQL `left ILIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`ilike_utf8`] for more details.
-#[cfg(feature = "dyn_cmp_dict")]
-fn ilike_dict<K: ArrowPrimitiveType>(
-    left: &DictionaryArray<K>,
-    right: &DictionaryArray<K>,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.value_type(), right.value_type()) {
-        (DataType::Utf8, DataType::Utf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i32>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i32>>().unwrap();
-
-            regex_like(left, right, false, |re_pattern| {
-                Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from ILIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i64>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i64>>().unwrap();
-
-            regex_like(left, right, false, |re_pattern| {
-                Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from ILIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        _ => Err(ArrowError::ComputeError(
-            "ilike_dict only supports DictionaryArray with Utf8 or LargeUtf8 values"
-                .to_string(),
-        )),
-    }
 }
 
 #[inline]
@@ -598,45 +510,6 @@ fn ilike_scalar<O: OffsetSizeTrait>(
 }
 
 /// Perform SQL `left ILIKE right` operation on [`StringArray`] /
-/// [`LargeStringArray`], or [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`] and a scalar.
-///
-/// See the documentation on [`ilike_utf8`] for more details.
-pub fn ilike_utf8_scalar_dyn(
-    left: &dyn Array,
-    right: &str,
-) -> Result<BooleanArray, ArrowError> {
-    match left.data_type() {
-        DataType::Utf8 => {
-            let left = as_string_array(left);
-            ilike_scalar(left, right)
-        }
-        DataType::LargeUtf8 => {
-            let left = as_largestring_array(left);
-            ilike_scalar(left, right)
-        }
-        DataType::Dictionary(_, _) => {
-            downcast_dictionary_array!(
-                left => {
-                    let dict_comparison = ilike_utf8_scalar_dyn(left.values().as_ref(), right)?;
-                    // TODO: Use take_boolean (#2967)
-                    let array = take(&dict_comparison, left.keys(), None)?;
-                    Ok(BooleanArray::from(array.data().clone()))
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "ilike_utf8_scalar_dyn only supports Utf8, LargeUtf8 or DictionaryArray (with feature `dyn_cmp_dict`) with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
-}
-
-/// Perform SQL `left ILIKE right` operation on [`StringArray`] /
 /// [`LargeStringArray`] and a scalar.
 ///
 /// See the documentation on [`ilike_utf8`] for more details.
@@ -655,6 +528,14 @@ pub fn nilike_utf8<OffsetSize: OffsetSizeTrait>(
     left: &GenericStringArray<OffsetSize>,
     right: &GenericStringArray<OffsetSize>,
 ) -> Result<BooleanArray, ArrowError> {
+    nilike(left, right)
+}
+
+#[inline]
+fn nilike<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
     regex_like(left, right, true, |re_pattern| {
         Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
             ArrowError::ComputeError(format!(
@@ -665,133 +546,12 @@ pub fn nilike_utf8<OffsetSize: OffsetSizeTrait>(
     })
 }
 
-/// Perform SQL `left NOT ILIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`ilike_utf8`] for more details.
-pub fn nilike_dyn(
-    left: &dyn Array,
-    right: &dyn Array,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.data_type(), right.data_type()) {
-        (DataType::Utf8, DataType::Utf8)  => {
-            let left = as_string_array(left);
-            let right = as_string_array(right);
-            nilike_utf8(left, right)
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = as_largestring_array(left);
-            let right = as_largestring_array(right);
-            nilike_utf8(left, right)
-        }
-        #[cfg(feature = "dyn_cmp_dict")]
-        (DataType::Dictionary(_, _), DataType::Dictionary(_, _)) => {
-            downcast_dictionary_array!(
-                left => {
-                    let right = as_dictionary_array(right);
-                    nilike_dict(left, right)
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "nilike_dyn only supports Utf8, LargeUtf8 or DictionaryArray (with feature `dyn_cmp_dict`) with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
-}
-
-/// Perform SQL `left NOT ILIKE right` operation on on [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`].
-///
-/// See the documentation on [`ilike_utf8`] for more details.
-#[cfg(feature = "dyn_cmp_dict")]
-fn nilike_dict<K: ArrowPrimitiveType>(
-    left: &DictionaryArray<K>,
-    right: &DictionaryArray<K>,
-) -> Result<BooleanArray, ArrowError> {
-    match (left.value_type(), right.value_type()) {
-        (DataType::Utf8, DataType::Utf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i32>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i32>>().unwrap();
-
-            regex_like(left, right, true, |re_pattern| {
-                Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from ILIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        (DataType::LargeUtf8, DataType::LargeUtf8) => {
-            let left = left.downcast_dict::<GenericStringArray<i64>>().unwrap();
-            let right = right.downcast_dict::<GenericStringArray<i64>>().unwrap();
-
-            regex_like(left, right, true, |re_pattern| {
-                Regex::new(&format!("(?i)^{}$", re_pattern)).map_err(|e| {
-                    ArrowError::ComputeError(format!(
-                        "Unable to build regex from ILIKE pattern: {}",
-                        e
-                    ))
-                })
-            })
-        }
-        _ => Err(ArrowError::ComputeError(
-            "nilike_dict only supports DictionaryArray with Utf8 or LargeUtf8 values"
-                .to_string(),
-        )),
-    }
-}
-
 #[inline]
 fn nilike_scalar<O: OffsetSizeTrait>(
     left: &GenericStringArray<O>,
     right: &str,
 ) -> Result<BooleanArray, ArrowError> {
     ilike_scalar_op(left, right, |x| !x)
-}
-
-/// Perform SQL `left NOT ILIKE right` operation on [`StringArray`] /
-/// [`LargeStringArray`], or [`DictionaryArray`] with values
-/// [`StringArray`]/[`LargeStringArray`] and a scalar.
-///
-/// See the documentation on [`ilike_utf8`] for more details.
-pub fn nilike_utf8_scalar_dyn(
-    left: &dyn Array,
-    right: &str,
-) -> Result<BooleanArray, ArrowError> {
-    match left.data_type() {
-        DataType::Utf8 => {
-            let left = as_string_array(left);
-            nilike_scalar(left, right)
-        }
-        DataType::LargeUtf8 => {
-            let left = as_largestring_array(left);
-            nilike_scalar(left, right)
-        }
-        DataType::Dictionary(_, _) => {
-            downcast_dictionary_array!(
-                left => {
-                    let dict_comparison = nilike_utf8_scalar_dyn(left.values().as_ref(), right)?;
-                    // TODO: Use take_boolean (#2967)
-                    let array = take(&dict_comparison, left.keys(), None)?;
-                    Ok(BooleanArray::from(array.data().clone()))
-                }
-                t => Err(ArrowError::ComputeError(format!(
-                    "Should be DictionaryArray but got: {}", t
-                )))
-            )
-        }
-        _ => {
-            Err(ArrowError::ComputeError(
-                "nilike_utf8_scalar_dyn only supports Utf8, LargeUtf8 or DictionaryArray with Utf8 or LargeUtf8 values".to_string(),
-            ))
-        }
-    }
 }
 
 /// Perform SQL `left NOT ILIKE right` operation on [`StringArray`] /
@@ -864,6 +624,117 @@ where
         )
     };
     Ok(BooleanArray::from(data))
+}
+
+/// Perform SQL `STARTSWITH(left, right)` operation on [`StringArray`] / [`LargeStringArray`].
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn starts_with_utf8<OffsetSize: OffsetSizeTrait>(
+    left: &GenericStringArray<OffsetSize>,
+    right: &GenericStringArray<OffsetSize>,
+) -> Result<BooleanArray, ArrowError> {
+    starts_with(left, right)
+}
+
+#[inline]
+fn starts_with<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
+    compare_op(left, right, |l, r| l.starts_with(r))
+}
+
+#[inline]
+fn starts_with_scalar<'a, L: ArrayAccessor<Item = &'a str>>(
+    left: L,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    compare_op_scalar(left, |item| item.starts_with(right))
+}
+
+/// Perform SQL `STARTSWITH(left, right)` operation on [`StringArray`] /
+/// [`LargeStringArray`] and a scalar.
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn starts_with_utf8_scalar<OffsetSize: OffsetSizeTrait>(
+    left: &GenericStringArray<OffsetSize>,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    starts_with_scalar(left, right)
+}
+
+/// Perform SQL `ENDSWITH(left, right)` operation on [`StringArray`] / [`LargeStringArray`].
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn ends_with_utf8<OffsetSize: OffsetSizeTrait>(
+    left: &GenericStringArray<OffsetSize>,
+    right: &GenericStringArray<OffsetSize>,
+) -> Result<BooleanArray, ArrowError> {
+    ends_with(left, right)
+}
+
+#[inline]
+fn ends_with<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
+    compare_op(left, right, |l, r| l.ends_with(r))
+}
+
+#[inline]
+fn ends_with_scalar<'a, L: ArrayAccessor<Item = &'a str>>(
+    left: L,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    compare_op_scalar(left, |item| item.ends_with(right))
+}
+
+/// Perform SQL `ENDSWITH(left, right)` operation on [`StringArray`] /
+/// [`LargeStringArray`] and a scalar.
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn ends_with_utf8_scalar<OffsetSize: OffsetSizeTrait>(
+    left: &GenericStringArray<OffsetSize>,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    ends_with_scalar(left, right)
+}
+
+/// Perform SQL `CONTAINS(left, right)` operation on [`StringArray`] / [`LargeStringArray`].
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn contains_utf8<OffsetSize: OffsetSizeTrait>(
+    left: &GenericStringArray<OffsetSize>,
+    right: &GenericStringArray<OffsetSize>,
+) -> Result<BooleanArray, ArrowError> {
+    contains(left, right)
+}
+
+#[inline]
+fn contains<'a, S: ArrayAccessor<Item = &'a str>>(
+    left: S,
+    right: S,
+) -> Result<BooleanArray, ArrowError> {
+    compare_op(left, right, |l, r| l.contains(r))
+}
+
+#[inline]
+fn contains_scalar<'a, L: ArrayAccessor<Item = &'a str>>(
+    left: L,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    compare_op_scalar(left, |item| item.contains(right))
+}
+
+/// Perform SQL `CONTAINS(left, right)` operation on [`StringArray`] /
+/// [`LargeStringArray`] and a scalar.
+///
+/// See the documentation on [`like_utf8`] for more details.
+pub fn contains_utf8_scalar<OffsetSize: OffsetSizeTrait>(
+    left: &GenericStringArray<OffsetSize>,
+    right: &str,
+) -> Result<BooleanArray, ArrowError> {
+    contains_scalar(left, right)
 }
 
 #[cfg(test)]
@@ -1015,6 +886,18 @@ mod tests {
         vec![true, false, true, false]
     );
 
+    // Replicates `test_utf8_array_like_scalar_start` `test_utf8_array_like_scalar_dyn_start` to
+    // demonstrate that `SQL STARTSWITH` works as expected.
+    test_utf8_scalar!(
+        test_utf8_array_starts_with_scalar_start,
+        test_utf8_array_starts_with_scalar_dyn_start,
+        vec!["arrow", "parrow", "arrows", "arr"],
+        "arrow",
+        starts_with_utf8_scalar,
+        starts_with_utf8_scalar_dyn,
+        vec![true, false, true, false]
+    );
+
     test_utf8_scalar!(
         test_utf8_array_like_scalar_end,
         test_utf8_array_like_scalar_dyn_end,
@@ -1022,6 +905,18 @@ mod tests {
         "%arrow",
         like_utf8_scalar,
         like_utf8_scalar_dyn,
+        vec![true, true, false, false]
+    );
+
+    // Replicates `test_utf8_array_like_scalar_end` `test_utf8_array_like_scalar_dyn_end` to
+    // demonstrate that `SQL ENDSWITH` works as expected.
+    test_utf8_scalar!(
+        test_utf8_array_ends_with_scalar_end,
+        test_utf8_array_ends_with_scalar_dyn_end,
+        vec!["arrow", "parrow", "arrows", "arr"],
+        "arrow",
+        ends_with_utf8_scalar,
+        ends_with_utf8_scalar_dyn,
         vec![true, true, false, false]
     );
 
@@ -1341,6 +1236,32 @@ mod tests {
         "%FFkoSS%",
         ilike_utf8_scalar,
         ilike_utf8_scalar_dyn,
+        vec![false, true, true, false, false, false, false, true, true, true]
+    );
+
+    // Replicates `test_utf8_array_ilike_unicode_contains` and
+    // `test_utf8_array_ilike_unicode_contains_dyn` to
+    // demonstrate that `SQL CONTAINS` works as expected.
+    //
+    // NOTE: 5 of the values were changed because the original used a case insensitive `ilike`.
+    test_utf8_scalar!(
+        test_utf8_array_contains_unicode_contains,
+        test_utf8_array_contains_unicode_contains_dyn,
+        vec![
+            "sdlkdfFkoßsdfs",
+            "sdlkdFFkoSSdggs", // Original was case insensitive "sdlkdfFkoSSdggs"
+            "sdlkdFFkoSSsdsd", // Original was case insensitive "sdlkdfFkosssdsd"
+            "FkoS",
+            "Fkos",
+            "ﬀkoSS",
+            "ﬀkoß",
+            "😃sadlksFFkoSSsh😃klF", // Original was case insensitive "😃sadlksffkosSsh😃klF"
+            "😱slgFFkoSSsh😃klF",    // Original was case insensitive "😱slgffkosSsh😃klF"
+            "FFkoSS",                    // "FFKoSS"
+        ],
+        "FFkoSS",
+        contains_utf8_scalar,
+        contains_utf8_scalar_dyn,
         vec![false, true, true, false, false, false, false, true, true, true]
     );
 

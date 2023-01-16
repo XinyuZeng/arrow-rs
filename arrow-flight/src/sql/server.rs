@@ -17,6 +17,7 @@
 
 use std::pin::Pin;
 
+use crate::sql::Any;
 use futures::Stream;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
@@ -32,7 +33,7 @@ use super::{
     CommandGetDbSchemas, CommandGetExportedKeys, CommandGetImportedKeys,
     CommandGetPrimaryKeys, CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables,
     CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementQuery,
-    CommandStatementUpdate, DoPutUpdateResult, ProstAnyExt, ProstMessageExt, SqlInfo,
+    CommandStatementUpdate, DoPutUpdateResult, ProstMessageExt, SqlInfo,
     TicketStatementQuery,
 };
 
@@ -63,7 +64,7 @@ pub trait FlightSqlService: Sync + Send + Sized + 'static {
     async fn do_get_fallback(
         &self,
         _request: Request<Ticket>,
-        message: prost_types::Any,
+        message: Any,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
         Err(Status::unimplemented(format!(
             "do_get: The defined request is invalid: {}",
@@ -311,8 +312,8 @@ where
         &self,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        let message: prost_types::Any =
-            Message::decode(&*request.get_ref().cmd).map_err(decode_error_to_status)?;
+        let message =
+            Any::decode(&*request.get_ref().cmd).map_err(decode_error_to_status)?;
 
         if message.is::<CommandStatementQuery>() {
             let token = message
@@ -411,10 +412,10 @@ where
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        let msg: prost_types::Any = Message::decode(&*request.get_ref().ticket)
+        let msg: Any = Message::decode(&*request.get_ref().ticket)
             .map_err(decode_error_to_status)?;
 
-        fn unpack<T: ProstMessageExt>(msg: prost_types::Any) -> Result<T, Status> {
+        fn unpack<T: ProstMessageExt>(msg: Any) -> Result<T, Status> {
             msg.unpack()
                 .map_err(arrow_error_to_status)?
                 .ok_or_else(|| Status::internal("Expected a command, but found none."))
@@ -462,9 +463,8 @@ where
         mut request: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
         let cmd = request.get_mut().message().await?.unwrap();
-        let message: prost_types::Any =
-            Message::decode(&*cmd.flight_descriptor.unwrap().cmd)
-                .map_err(decode_error_to_status)?;
+        let message = Any::decode(&*cmd.flight_descriptor.unwrap().cmd)
+            .map_err(decode_error_to_status)?;
         if message.is::<CommandStatementUpdate>() {
             let token = message
                 .unpack()
@@ -473,7 +473,7 @@ where
             let record_count = self.do_put_statement_update(token, request).await?;
             let result = DoPutUpdateResult { record_count };
             let output = futures::stream::iter(vec![Ok(PutResult {
-                app_metadata: result.encode_to_vec(),
+                app_metadata: result.encode_to_vec().into(),
             })]);
             return Ok(Response::new(Box::pin(output)));
         }
@@ -494,7 +494,7 @@ where
                 .await?;
             let result = DoPutUpdateResult { record_count };
             let output = futures::stream::iter(vec![Ok(PutResult {
-                app_metadata: result.encode_to_vec(),
+                app_metadata: result.encode_to_vec().into(),
             })]);
             return Ok(Response::new(Box::pin(output)));
         }
@@ -536,8 +536,8 @@ where
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         if request.get_ref().r#type == CREATE_PREPARED_STATEMENT {
-            let any: prost_types::Any = Message::decode(&*request.get_ref().body)
-                .map_err(decode_error_to_status)?;
+            let any =
+                Any::decode(&*request.get_ref().body).map_err(decode_error_to_status)?;
 
             let cmd: ActionCreatePreparedStatementRequest = any
                 .unpack()
@@ -551,13 +551,13 @@ where
                 .do_action_create_prepared_statement(cmd, request)
                 .await?;
             let output = futures::stream::iter(vec![Ok(super::super::gen::Result {
-                body: stmt.as_any().encode_to_vec(),
+                body: stmt.as_any().encode_to_vec().into(),
             })]);
             return Ok(Response::new(Box::pin(output)));
         }
         if request.get_ref().r#type == CLOSE_PREPARED_STATEMENT {
-            let any: prost_types::Any = Message::decode(&*request.get_ref().body)
-                .map_err(decode_error_to_status)?;
+            let any =
+                Any::decode(&*request.get_ref().body).map_err(decode_error_to_status)?;
 
             let cmd: ActionClosePreparedStatementRequest = any
                 .unpack()

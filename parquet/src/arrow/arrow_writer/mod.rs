@@ -21,7 +21,9 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_array::cast::as_primitive_array;
+use arrow_array::types::Decimal128Type;
+use arrow_array::{types, Array, ArrayRef, RecordBatch};
 use arrow_schema::{DataType as ArrowDataType, IntervalUnit, SchemaRef};
 
 use super::schema::{
@@ -32,7 +34,7 @@ use super::schema::{
 use crate::arrow::arrow_writer::byte_array::ByteArrayWriter;
 use crate::column::writer::{ColumnWriter, ColumnWriterImpl};
 use crate::errors::{ParquetError, Result};
-use crate::file::metadata::RowGroupMetaDataPtr;
+use crate::file::metadata::{KeyValue, RowGroupMetaDataPtr};
 use crate::file::properties::WriterProperties;
 use crate::file::writer::SerializedRowGroupWriter;
 use crate::{data_type::*, file::writer::SerializedFileWriter};
@@ -156,6 +158,13 @@ impl<W: Write> ArrowWriter<W> {
     /// Flushes all buffered rows into a new row group
     pub fn flush(&mut self) -> Result<()> {
         self.flush_rows(self.buffered_rows)
+    }
+
+    /// Additional [`KeyValue`] metadata to be written in addition to those from [`WriterProperties`]
+    ///
+    /// This method provide a way to append kv_metadata after write RecordBatch
+    pub fn append_key_value_metadata(&mut self, kv_metadata: KeyValue) {
+        self.writer.append_key_value_metadata(kv_metadata)
     }
 
     /// Flushes `num_rows` from the buffer into a new row group
@@ -390,6 +399,12 @@ fn write_leaf(
                     let array: &[i32] = data.buffers()[0].typed_data();
                     write_primitive(typed, &array[offset..offset + data.len()], levels)?
                 }
+                ArrowDataType::Decimal128(_, _) => {
+                    // use the int32 to represent the decimal with low precision
+                    let array = as_primitive_array::<Decimal128Type>(column)
+                        .unary::<_, types::Int32Type>(|v| v as i32);
+                    write_primitive(typed, array.values(), levels)?
+                }
                 _ => {
                     let array = arrow_cast::cast(column, &ArrowDataType::Int32)?;
                     let array = array
@@ -427,6 +442,12 @@ fn write_leaf(
                     let offset = data.offset();
                     let array: &[i64] = data.buffers()[0].typed_data();
                     write_primitive(typed, &array[offset..offset + data.len()], levels)?
+                }
+                ArrowDataType::Decimal128(_, _) => {
+                    // use the int64 to represent the decimal with low precision
+                    let array = as_primitive_array::<Decimal128Type>(column)
+                        .unary::<_, types::Int64Type>(|v| v as i64);
+                    write_primitive(typed, array.values(), levels)?
                 }
                 _ => {
                     let array = arrow_cast::cast(column, &ArrowDataType::Int64)?;
@@ -833,23 +854,32 @@ mod tests {
         roundtrip(batch, Some(SMALL_SIZE / 2));
     }
 
-    #[test]
-    fn arrow_writer_decimal() {
-        let decimal_field = Field::new("a", DataType::Decimal128(5, 2), false);
+    fn get_decimal_batch(precision: u8, scale: i8) -> RecordBatch {
+        let decimal_field =
+            Field::new("a", DataType::Decimal128(precision, scale), false);
         let schema = Schema::new(vec![decimal_field]);
 
         let decimal_values = vec![10_000, 50_000, 0, -100]
             .into_iter()
             .map(Some)
             .collect::<Decimal128Array>()
-            .with_precision_and_scale(5, 2)
+            .with_precision_and_scale(precision, scale)
             .unwrap();
 
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(decimal_values)])
-                .unwrap();
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(decimal_values)]).unwrap()
+    }
 
-        roundtrip(batch, Some(SMALL_SIZE / 2));
+    #[test]
+    fn arrow_writer_decimal() {
+        // int32 to store the decimal value
+        let batch_int32_decimal = get_decimal_batch(5, 2);
+        roundtrip(batch_int32_decimal, Some(SMALL_SIZE / 2));
+        // int64 to store the decimal value
+        let batch_int64_decimal = get_decimal_batch(12, 2);
+        roundtrip(batch_int64_decimal, Some(SMALL_SIZE / 2));
+        // fixed_length_byte_array to store the decimal value
+        let batch_fixed_len_byte_array_decimal = get_decimal_batch(30, 2);
+        roundtrip(batch_fixed_len_byte_array_decimal, Some(SMALL_SIZE / 2));
     }
 
     #[test]
@@ -1173,6 +1203,7 @@ mod tests {
     }
 
     const SMALL_SIZE: usize = 7;
+    const MEDIUM_SIZE: usize = 63;
 
     fn roundtrip(
         expected_batch: RecordBatch,
@@ -1192,7 +1223,14 @@ mod tests {
         files
     }
 
-    fn roundtrip_opts(expected_batch: &RecordBatch, props: WriterProperties) -> File {
+    fn roundtrip_opts_with_array_validation<F>(
+        expected_batch: &RecordBatch,
+        props: WriterProperties,
+        validate: F,
+    ) -> File
+    where
+        F: Fn(&ArrayData, &ArrayData),
+    {
         let file = tempfile::tempfile().unwrap();
 
         let mut writer = ArrowWriter::try_new(
@@ -1218,11 +1256,16 @@ mod tests {
         for i in 0..expected_batch.num_columns() {
             let expected_data = expected_batch.column(i).data();
             let actual_data = actual_batch.column(i).data();
-
-            assert_eq!(expected_data, actual_data);
+            validate(expected_data, actual_data);
         }
 
         file
+    }
+
+    fn roundtrip_opts(expected_batch: &RecordBatch, props: WriterProperties) -> File {
+        roundtrip_opts_with_array_validation(expected_batch, props, |a, b| {
+            assert_eq!(a, b)
+        })
     }
 
     struct RoundTripOptions {
@@ -1829,6 +1872,47 @@ mod tests {
 
         let values = Arc::new(s);
         one_column_roundtrip(values, false);
+    }
+
+    #[test]
+    fn fallback_flush_data_page() {
+        //tests if the Fallback::flush_data_page clears all buffers correctly
+        let raw_values: Vec<_> = (0..MEDIUM_SIZE).map(|i| i.to_string()).collect();
+        let values = Arc::new(StringArray::from(raw_values));
+        let encodings = vec![
+            Encoding::DELTA_BYTE_ARRAY,
+            Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        ];
+        let data_type = values.data_type().clone();
+        let schema = Arc::new(Schema::new(vec![Field::new("col", data_type, false)]));
+        let expected_batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+
+        let row_group_sizes = [1024, SMALL_SIZE, SMALL_SIZE / 2, SMALL_SIZE / 2 + 1, 10];
+        let data_pagesize_limit: usize = 32;
+        let write_batch_size: usize = 16;
+
+        for encoding in &encodings {
+            for row_group_size in row_group_sizes {
+                let props = WriterProperties::builder()
+                    .set_writer_version(WriterVersion::PARQUET_2_0)
+                    .set_max_row_group_size(row_group_size)
+                    .set_dictionary_enabled(false)
+                    .set_encoding(*encoding)
+                    .set_data_pagesize_limit(data_pagesize_limit)
+                    .set_write_batch_size(write_batch_size)
+                    .build();
+
+                roundtrip_opts_with_array_validation(&expected_batch, props, |a, b| {
+                    let string_array_a = StringArray::from(a.clone());
+                    let string_array_b = StringArray::from(b.clone());
+                    let vec_a: Vec<&str> =
+                        string_array_a.iter().map(|v| v.unwrap()).collect();
+                    let vec_b: Vec<&str> =
+                        string_array_b.iter().map(|v| v.unwrap()).collect();
+                    assert_eq!(vec_a, vec_b, "failed for encoder: {encoding:?} and row_group_size: {row_group_size:?}");
+                });
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@
 
 [package]
 name = "object_store"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT/Apache-2.0"
 readme = "README.md"
@@ -43,8 +43,8 @@ url = "2.2"
 walkdir = "2"
 
 # Cloud storage support
-base64 = { version = "0.20", default-features = false, features = ["std"], optional = true }
-quick-xml = { version = "0.26.0", features = ["serialize"], optional = true }
+base64 = { version = "0.21", default-features = false, features = ["std"], optional = true }
+quick-xml = { version = "0.27.0", features = ["serialize"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 serde_json = { version = "1.0", default-features = false, optional = true }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"], optional = true }
@@ -53,14 +53,15 @@ ring = { version = "0.16", default-features = false, features = ["std"], optiona
 rustls-pemfile = { version = "1.0", default-features = false, optional = true }
 
 # AWS Profile support
-aws-types = { version = "0.51", optional = true }
-aws-config = { version = "0.51", optional = true }
+aws-types = { version = "0.52", optional = true }
+aws-config = { version = "0.52", optional = true }
 
 [features]
 cloud = ["serde", "serde_json", "quick-xml", "reqwest", "reqwest/json", "reqwest/stream", "chrono/serde", "base64", "rand", "ring"]
 azure = ["cloud"]
 gcp = ["cloud", "rustls-pemfile"]
 aws = ["cloud"]
+http = ["cloud"]
 
 # Experimental support for AWS_PROFILE
 aws_profile = ["aws", "aws-config", "aws-types"]

@@ -116,6 +116,14 @@ use crate::file::FOOTER_SIZE;
 
 use crate::schema::types::{ColumnDescPtr, SchemaDescPtr};
 
+mod metadata;
+pub use metadata::*;
+
+#[cfg(feature = "object_store")]
+mod store;
+#[cfg(feature = "object_store")]
+pub use store::*;
+
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 pub trait AsyncFileReader: Send {
     /// Retrieve the bytes in `range`
@@ -560,7 +568,7 @@ where
                         return Poll::Ready(Some(Err(e)));
                     }
                 },
-                StreamState::Error => return Poll::Pending,
+                StreamState::Error => return Poll::Ready(None), // Ends the stream as error happens.
             }
         }
     }
@@ -1360,6 +1368,6 @@ mod tests {
             .build()
             .unwrap();
         assert_ne!(1024, file_rows);
-        assert_eq!(stream.batch_size, file_rows as usize);
+        assert_eq!(stream.batch_size, file_rows);
     }
 }

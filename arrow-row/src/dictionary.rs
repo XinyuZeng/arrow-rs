@@ -15,17 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::compute::SortOptions;
-use crate::row::fixed::{FixedLengthEncoding, FromSlice};
-use crate::row::interner::{Interned, OrderPreservingInterner};
-use crate::row::{null_sentinel, Rows};
+use crate::fixed::{FixedLengthEncoding, FromSlice};
+use crate::interner::{Interned, OrderPreservingInterner};
+use crate::{null_sentinel, Rows};
 use arrow_array::builder::*;
 use arrow_array::cast::*;
 use arrow_array::types::*;
 use arrow_array::*;
 use arrow_buffer::{ArrowNativeType, MutableBuffer, ToByteSlice};
 use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::{ArrowError, DataType};
+use arrow_schema::{ArrowError, DataType, SortOptions};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
@@ -271,10 +270,7 @@ fn decode_primitive<T: ArrowPrimitiveType>(
 where
     T::Native: FixedLengthEncoding,
 {
-    assert_eq!(
-        std::mem::discriminant(&T::DATA_TYPE),
-        std::mem::discriminant(&data_type),
-    );
+    assert!(PrimitiveArray::<T>::is_compatible(&data_type));
 
     // SAFETY:
     // Validated data type above

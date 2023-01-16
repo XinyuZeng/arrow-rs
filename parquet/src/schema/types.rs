@@ -22,7 +22,8 @@ use std::{collections::HashMap, convert::From, fmt, sync::Arc};
 use crate::format::SchemaElement;
 
 use crate::basic::{
-    ConvertedType, LogicalType, Repetition, TimeUnit, Type as PhysicalType,
+    ColumnOrder, ConvertedType, LogicalType, Repetition, SortOrder, TimeUnit,
+    Type as PhysicalType,
 };
 use crate::errors::{ParquetError, Result};
 
@@ -846,6 +847,15 @@ impl ColumnDescriptor {
             _ => panic!("Expected primitive type!"),
         }
     }
+
+    /// Returns the sort order for this column
+    pub fn sort_order(&self) -> SortOrder {
+        ColumnOrder::get_sort_order(
+            self.logical_type(),
+            self.converted_type(),
+            self.physical_type(),
+        )
+    }
 }
 
 /// A schema descriptor. This encapsulates the top-level schemas for all the columns,
@@ -1103,7 +1113,7 @@ fn from_thrift_helper(
             let mut fields = vec![];
             let mut next_index = index + 1;
             for _ in 0..n {
-                let child_result = from_thrift_helper(elements, next_index as usize)?;
+                let child_result = from_thrift_helper(elements, next_index)?;
                 next_index = child_result.0;
                 fields.push(child_result.1);
             }

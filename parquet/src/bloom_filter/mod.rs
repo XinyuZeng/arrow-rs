@@ -141,7 +141,7 @@ fn chunk_read_bloom_filter_header_and_offset<R: ChunkReader>(
     offset: u64,
     reader: Arc<R>,
 ) -> Result<(BloomFilterHeader, u64), ParquetError> {
-    let buffer = reader.get_bytes(offset as u64, SBBF_HEADER_SIZE_ESTIMATE)?;
+    let buffer = reader.get_bytes(offset, SBBF_HEADER_SIZE_ESTIMATE)?;
     let (header, length) = read_bloom_filter_header_and_length(buffer)?;
     Ok((header, offset + length))
 }
@@ -328,10 +328,6 @@ impl Sbbf {
     fn check_hash(&self, hash: u64) -> bool {
         let block_index = self.hash_to_block_index(hash);
         self.0[block_index].check(hash as u32)
-    }
-
-    pub(crate) fn block_num(&self) -> usize {
-        self.0.len()
     }
 }
 

@@ -15,12 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! A native Rust implementation of [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html)
+//! for exchanging [Arrow](https://arrow.apache.org) data between processes.
+//!
+//! Please see the [arrow-flight crates.io](https://crates.io/crates/arrow-flight)
+//! page for feature flags and more information.
+//!
+//! # Overview
+//!
+//! This crate contains:
+//!
+//! 1. Low level [prost] generated structs
+//!  for Flight gRPC protobuf messages, such as [`FlightData`].
+//!
+//! 2. Low level [tonic] generated [`flight_service_client`] and
+//! [`flight_service_server`].
 #![allow(rustdoc::invalid_html_tags)]
 
 use arrow_ipc::{convert, writer, writer::EncodedData, writer::IpcWriteOptions};
 use arrow_schema::{ArrowError, Schema};
 
 use arrow_ipc::convert::try_schema_from_ipc_buffer;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
+use bytes::Bytes;
 use std::{
     convert::{TryFrom, TryInto},
     fmt,
@@ -35,21 +53,40 @@ mod gen {
     include!("arrow.flight.protocol.rs");
 }
 
+/// Defines a `Flight` for generation or retrieval.
 pub mod flight_descriptor {
     use super::gen;
     pub use gen::flight_descriptor::DescriptorType;
 }
 
+/// Low Level [tonic] [`FlightServiceClient`](gen::flight_service_client::FlightServiceClient).
 pub mod flight_service_client {
     use super::gen;
     pub use gen::flight_service_client::FlightServiceClient;
 }
 
+/// Low Level [tonic] [`FlightServiceServer`](gen::flight_service_server::FlightServiceServer)
+/// and [`FlightService`](gen::flight_service_server::FlightService).
 pub mod flight_service_server {
     use super::gen;
     pub use gen::flight_service_server::FlightService;
     pub use gen::flight_service_server::FlightServiceServer;
 }
+
+/// Mid Level [`FlightClient`]
+pub mod client;
+pub use client::FlightClient;
+
+/// Decoder to create [`RecordBatch`](arrow_array::RecordBatch) streams from [`FlightData`] streams.
+/// See [`FlightRecordBatchStream`](decode::FlightRecordBatchStream).
+pub mod decode;
+
+/// Encoder to create [`FlightData`] streams from [`RecordBatch`](arrow_array::RecordBatch) streams.
+/// See [`FlightDataEncoderBuilder`](encode::FlightDataEncoderBuilder).
+pub mod encode;
+
+/// Common error types
+pub mod error;
 
 pub use gen::Action;
 pub use gen::ActionType;
@@ -83,7 +120,7 @@ pub struct SchemaAsIpc<'a> {
 /// IpcMessage represents a `Schema` in the format expected in
 /// `FlightInfo.schema`
 #[derive(Debug)]
-pub struct IpcMessage(pub Vec<u8>);
+pub struct IpcMessage(pub Bytes);
 
 // Useful conversion functions
 
@@ -97,7 +134,7 @@ fn flight_schema_as_encoded_data(
 
 fn flight_schema_as_flatbuffer(schema: &Schema, options: &IpcWriteOptions) -> IpcMessage {
     let encoded_data = flight_schema_as_encoded_data(schema, options);
-    IpcMessage(encoded_data.ipc_message)
+    IpcMessage(encoded_data.ipc_message.into())
 }
 
 // Implement a bunch of useful traits for various conversions, displays,
@@ -106,7 +143,7 @@ fn flight_schema_as_flatbuffer(schema: &Schema, options: &IpcWriteOptions) -> Ip
 // Deref
 
 impl Deref for IpcMessage {
-    type Target = Vec<u8>;
+    type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -230,7 +267,7 @@ impl fmt::Display for Ticket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Ticket {{")?;
         write!(f, " ticket: ")?;
-        write!(f, "{}", base64::encode(&self.ticket))
+        write!(f, "{}", BASE64_STANDARD.encode(&self.ticket))
     }
 }
 
@@ -239,8 +276,8 @@ impl fmt::Display for Ticket {
 impl From<EncodedData> for FlightData {
     fn from(data: EncodedData) -> Self {
         FlightData {
-            data_header: data.ipc_message,
-            data_body: data.arrow_data,
+            data_header: data.ipc_message.into(),
+            data_body: data.arrow_data.into(),
             ..Default::default()
         }
     }
@@ -294,7 +331,7 @@ fn schema_to_ipc_format(schema_ipc: SchemaAsIpc) -> ArrowResult<IpcMessage> {
 
     let mut schema = vec![];
     writer::write_message(&mut schema, encoded_data, pair.1)?;
-    Ok(IpcMessage(schema))
+    Ok(IpcMessage(schema.into()))
 }
 
 impl TryFrom<&FlightData> for Schema {
@@ -313,8 +350,7 @@ impl TryFrom<FlightInfo> for Schema {
     type Error = ArrowError;
 
     fn try_from(value: FlightInfo) -> ArrowResult<Self> {
-        let msg = IpcMessage(value.schema);
-        msg.try_into()
+        value.try_decode_schema()
     }
 }
 
@@ -322,14 +358,21 @@ impl TryFrom<IpcMessage> for Schema {
     type Error = ArrowError;
 
     fn try_from(value: IpcMessage) -> ArrowResult<Self> {
-        try_schema_from_ipc_buffer(value.0.as_slice())
+        try_schema_from_ipc_buffer(&value)
     }
 }
 
 impl TryFrom<&SchemaResult> for Schema {
     type Error = ArrowError;
     fn try_from(data: &SchemaResult) -> ArrowResult<Self> {
-        try_schema_from_ipc_buffer(data.schema.as_slice())
+        try_schema_from_ipc_buffer(&data.schema)
+    }
+}
+
+impl TryFrom<SchemaResult> for Schema {
+    type Error = ArrowError;
+    fn try_from(data: SchemaResult) -> ArrowResult<Self> {
+        (&data).try_into()
     }
 }
 
@@ -339,24 +382,24 @@ impl FlightData {
     pub fn new(
         flight_descriptor: Option<FlightDescriptor>,
         message: IpcMessage,
-        app_metadata: Vec<u8>,
-        data_body: Vec<u8>,
+        app_metadata: impl Into<Bytes>,
+        data_body: impl Into<Bytes>,
     ) -> Self {
         let IpcMessage(vals) = message;
         FlightData {
             flight_descriptor,
             data_header: vals,
-            app_metadata,
-            data_body,
+            app_metadata: app_metadata.into(),
+            data_body: data_body.into(),
         }
     }
 }
 
 impl FlightDescriptor {
-    pub fn new_cmd(cmd: Vec<u8>) -> Self {
+    pub fn new_cmd(cmd: impl Into<Bytes>) -> Self {
         FlightDescriptor {
             r#type: DescriptorType::Cmd.into(),
-            cmd,
+            cmd: cmd.into(),
             ..Default::default()
         }
     }
@@ -387,6 +430,12 @@ impl FlightInfo {
             total_bytes,
         }
     }
+
+    /// Try and convert the data in this  `FlightInfo` into a [`Schema`]
+    pub fn try_decode_schema(self) -> ArrowResult<Schema> {
+        let msg = IpcMessage(self.schema);
+        msg.try_into()
+    }
 }
 
 impl<'a> SchemaAsIpc<'a> {
@@ -394,6 +443,23 @@ impl<'a> SchemaAsIpc<'a> {
         SchemaAsIpc {
             pair: (schema, options),
         }
+    }
+}
+
+impl Action {
+    /// Create a new Action with type and body
+    pub fn new(action_type: impl Into<String>, body: impl Into<Bytes>) -> Self {
+        Self {
+            r#type: action_type.into(),
+            body: body.into(),
+        }
+    }
+}
+
+impl Result {
+    /// Create a new Result with the specified body
+    pub fn new(body: impl Into<Bytes>) -> Self {
+        Self { body: body.into() }
     }
 }
 

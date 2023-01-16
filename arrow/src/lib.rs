@@ -31,6 +31,7 @@
 //!
 //! The current list of sub-crates is:
 //!
+//! * [`arrow-arith`][arrow_arith] - arithmetic kernels
 //! * [`arrow-array`][arrow_array] - type-safe arrow array abstractions
 //! * [`arrow-buffer`][arrow_buffer] - buffer abstractions for arrow arrays
 //! * [`arrow-cast`][arrow_cast] - cast kernels for arrow arrays
@@ -39,6 +40,7 @@
 //! * [`arrow-ipc`][arrow_ipc] - read/write IPC to arrow format
 //! * [`arrow-json`][arrow_json] - read/write JSON to arrow format
 //! * [`arrow-ord`][arrow_ord] - ordering kernels for arrow arrays
+//! * [`arrow-row`][arrow_row] - comparable row format
 //! * [`arrow-schema`][arrow_schema] - the logical types for arrow arrays
 //! * [`arrow-select`][arrow_select] - selection kernels for arrow arrays
 //! * [`arrow-string`][arrow_string] - string kernels for arrow arrays
@@ -328,7 +330,7 @@ pub mod pyarrow;
 pub mod record_batch {
     pub use arrow_array::{RecordBatch, RecordBatchOptions, RecordBatchReader};
 }
-pub mod row;
 pub use arrow_array::temporal_conversions;
+pub use arrow_row as row;
 pub mod tensor;
 pub mod util;

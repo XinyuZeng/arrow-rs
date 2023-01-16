@@ -16,14 +16,12 @@
 // under the License.
 
 use crate::array::PrimitiveArray;
-use crate::compute::SortOptions;
-use crate::datatypes::ArrowPrimitiveType;
-use crate::row::{null_sentinel, Rows};
+use crate::{null_sentinel, Rows};
 use arrow_array::builder::BufferBuilder;
-use arrow_array::{BooleanArray, FixedSizeBinaryArray};
+use arrow_array::{ArrowPrimitiveType, BooleanArray, FixedSizeBinaryArray};
 use arrow_buffer::{bit_util, i256, ArrowNativeType, Buffer, MutableBuffer};
 use arrow_data::{ArrayData, ArrayDataBuilder};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SortOptions};
 use half::f16;
 
 pub trait FromSlice {
@@ -345,10 +343,7 @@ pub fn decode_primitive<T: ArrowPrimitiveType>(
 where
     T::Native: FixedLengthEncoding,
 {
-    assert_eq!(
-        std::mem::discriminant(&T::DATA_TYPE),
-        std::mem::discriminant(&data_type),
-    );
+    assert!(PrimitiveArray::<T>::is_compatible(&data_type));
     // SAFETY:
     // Validated data type above
     unsafe { decode_fixed::<T::Native>(rows, data_type, options).into() }

@@ -56,6 +56,12 @@ jobs:
       - name: Test --all-features
         run: |
           cargo test -p arrow-flight --all-features
+      - name: Test --examples
+        run: |
+          cargo test -p arrow-flight  --features=flight-sql-experimental --examples
+      - name: Test --examples with TLS
+        run: |
+          cargo test -p arrow-flight  --features=flight-sql-experimental,tls --examples
       - name: Verify workspace clean
         run: git diff --exit-code
 
@@ -71,4 +77,4 @@ jobs:
       - name: Setup Clippy
         run: rustup component add clippy
       - name: Run clippy
-        run: cargo clippy -p arrow-flight --all-features -- -D warnings
+        run: cargo clippy -p arrow-flight --all-targets --all-features -- -D warnings

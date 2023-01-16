@@ -21,9 +21,9 @@
 use crate::bloom_filter::Sbbf;
 use crate::format as parquet;
 use crate::format::{ColumnIndex, OffsetIndex, RowGroup};
-use std::io::BufWriter;
+use std::io::{BufWriter, IoSlice};
 use std::{io::Write, sync::Arc};
-use thrift::protocol::{TCompactOutputProtocol, TOutputProtocol, TSerializable};
+use thrift::protocol::{TCompactOutputProtocol, TSerializable};
 
 use crate::basic::PageType;
 use crate::column::writer::{
@@ -44,17 +44,19 @@ use crate::schema::types::{
 };
 
 /// A wrapper around a [`Write`] that keeps track of the number
-/// of bytes that have been written
-pub struct TrackedWrite<W> {
-    inner: W,
+/// of bytes that have been written. The given [`Write`] is wrapped
+/// with a [`BufWriter`] to optimize writing performance.
+pub struct TrackedWrite<W: Write> {
+    inner: BufWriter<W>,
     bytes_written: usize,
 }
 
 impl<W: Write> TrackedWrite<W> {
     /// Create a new [`TrackedWrite`] from a [`Write`]
     pub fn new(inner: W) -> Self {
+        let buf_write = BufWriter::new(inner);
         Self {
-            inner,
+            inner: buf_write,
             bytes_written: 0,
         }
     }
@@ -65,8 +67,13 @@ impl<W: Write> TrackedWrite<W> {
     }
 
     /// Returns the underlying writer.
-    pub fn into_inner(self) -> W {
-        self.inner
+    pub fn into_inner(self) -> Result<W> {
+        self.inner.into_inner().map_err(|err| {
+            ParquetError::General(format!(
+                "fail to get inner writer: {:?}",
+                err.to_string()
+            ))
+        })
     }
 }
 
@@ -75,6 +82,19 @@ impl<W: Write> Write for TrackedWrite<W> {
         let bytes = self.inner.write(buf)?;
         self.bytes_written += bytes;
         Ok(bytes)
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let bytes = self.inner.write_vectored(bufs)?;
+        self.bytes_written += bytes;
+        Ok(bytes)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(buf)?;
+        self.bytes_written += buf.len();
+
+        Ok(())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -122,6 +142,8 @@ pub struct SerializedFileWriter<W: Write> {
     column_indexes: Vec<Vec<Option<ColumnIndex>>>,
     offset_indexes: Vec<Vec<Option<OffsetIndex>>>,
     row_group_index: usize,
+    // kv_metadatas will be appended to `props` when `write_metadata`
+    kv_metadatas: Vec<KeyValue>,
 }
 
 impl<W: Write> SerializedFileWriter<W> {
@@ -139,6 +161,7 @@ impl<W: Write> SerializedFileWriter<W> {
             column_indexes: Vec::new(),
             offset_indexes: Vec::new(),
             row_group_index: 0,
+            kv_metadatas: Vec::new(),
         })
     }
 
@@ -207,7 +230,6 @@ impl<W: Write> SerializedFileWriter<W> {
                         let start_offset = self.buf.bytes_written();
                         let mut protocol = TCompactOutputProtocol::new(&mut self.buf);
                         offset_index.write_to_out_protocol(&mut protocol)?;
-                        protocol.flush()?;
                         let end_offset = self.buf.bytes_written();
                         // set offset and index for offset index
                         column_metadata.offset_index_offset = Some(start_offset as i64);
@@ -226,27 +248,23 @@ impl<W: Write> SerializedFileWriter<W> {
         // iter row group
         // iter each column
         // write bloom filter to the file
-        let mut start_offset = self.buf.bytes_written();
-        let mut writer = BufWriter::new(&mut self.buf);
-
         for (row_group_idx, row_group) in row_groups.iter_mut().enumerate() {
             for (column_idx, column_chunk) in row_group.columns.iter_mut().enumerate() {
                 match &self.bloom_filters[row_group_idx][column_idx] {
                     Some(bloom_filter) => {
-                        bloom_filter.write(&mut writer)?;
+                        let start_offset = self.buf.bytes_written();
+                        bloom_filter.write(&mut self.buf)?;
                         // set offset and index for bloom filter
                         column_chunk
                             .meta_data
                             .as_mut()
                             .expect("can't have bloom filter without column metadata")
                             .bloom_filter_offset = Some(start_offset as i64);
-                        start_offset += bloom_filter.block_num() * 32;
                     }
                     None => {}
                 }
             }
         }
-        writer.flush()?;
         Ok(())
     }
 
@@ -263,7 +281,6 @@ impl<W: Write> SerializedFileWriter<W> {
                         let start_offset = self.buf.bytes_written();
                         let mut protocol = TCompactOutputProtocol::new(&mut self.buf);
                         column_index.write_to_out_protocol(&mut protocol)?;
-                        protocol.flush()?;
                         let end_offset = self.buf.bytes_written();
                         // set offset and index for offset index
                         column_metadata.column_index_offset = Some(start_offset as i64);
@@ -293,12 +310,18 @@ impl<W: Write> SerializedFileWriter<W> {
         self.write_column_indexes(&mut row_groups)?;
         self.write_offset_indexes(&mut row_groups)?;
 
+        let key_value_metadata = match self.props.key_value_metadata() {
+            Some(kv) => Some(kv.iter().chain(&self.kv_metadatas).cloned().collect()),
+            None if self.kv_metadatas.is_empty() => None,
+            None => Some(self.kv_metadatas.clone()),
+        };
+
         let file_metadata = parquet::FileMetaData {
             num_rows,
             row_groups,
+            key_value_metadata,
             version: self.props.writer_version().as_num(),
             schema: types::to_thrift(self.schema.as_ref())?,
-            key_value_metadata: self.props.key_value_metadata().cloned(),
             created_by: Some(self.props.created_by().to_owned()),
             column_orders: None,
             encryption_algorithm: None,
@@ -310,7 +333,6 @@ impl<W: Write> SerializedFileWriter<W> {
         {
             let mut protocol = TCompactOutputProtocol::new(&mut self.buf);
             file_metadata.write_to_out_protocol(&mut protocol)?;
-            protocol.flush()?;
         }
         let end_pos = self.buf.bytes_written();
 
@@ -331,12 +353,16 @@ impl<W: Write> SerializedFileWriter<W> {
         }
     }
 
+    pub fn append_key_value_metadata(&mut self, kv_metadata: KeyValue) {
+        self.kv_metadatas.push(kv_metadata);
+    }
+
     /// Writes the file footer and returns the underlying writer.
     pub fn into_inner(mut self) -> Result<W> {
         self.assert_previous_writer_closed()?;
         let _ = self.write_metadata()?;
 
-        Ok(self.buf.into_inner())
+        self.buf.into_inner()
     }
 }
 
@@ -558,7 +584,7 @@ impl<'a> SerializedColumnWriter<'a> {
 /// Writes and serializes pages and metadata into output stream.
 ///
 /// `SerializedPageWriter` should not be used after calling `close()`.
-pub struct SerializedPageWriter<'a, W> {
+pub struct SerializedPageWriter<'a, W: Write> {
     sink: &'a mut TrackedWrite<W>,
 }
 
@@ -576,7 +602,6 @@ impl<'a, W: Write> SerializedPageWriter<'a, W> {
         {
             let mut protocol = TCompactOutputProtocol::new(&mut self.sink);
             header.write_to_out_protocol(&mut protocol)?;
-            protocol.flush()?;
         }
         Ok(self.sink.bytes_written() - start_pos)
     }
@@ -673,7 +698,6 @@ impl<'a, W: Write> PageWriter for SerializedPageWriter<'a, W> {
         metadata
             .to_column_metadata_thrift()
             .write_to_out_protocol(&mut protocol)?;
-        protocol.flush()?;
         Ok(())
     }
 
@@ -702,6 +726,7 @@ mod tests {
     };
     use crate::format::SortingColumn;
     use crate::record::{Row, RowAccessor};
+    use crate::schema::parser::parse_message_type;
     use crate::schema::types::{ColumnDescriptor, ColumnPath};
     use crate::util::memory::ByteBufferPtr;
 
@@ -1338,5 +1363,125 @@ mod tests {
                 assert_ne!(None, column_chunk.offset_index_length);
             })
         });
+    }
+
+    fn test_kv_metadata(
+        initial_kv: Option<Vec<KeyValue>>,
+        final_kv: Option<Vec<KeyValue>>,
+    ) {
+        let schema = Arc::new(
+            types::Type::group_type_builder("schema")
+                .with_fields(&mut vec![Arc::new(
+                    types::Type::primitive_type_builder("col1", Type::INT32)
+                        .with_repetition(Repetition::REQUIRED)
+                        .build()
+                        .unwrap(),
+                )])
+                .build()
+                .unwrap(),
+        );
+        let mut out = Vec::with_capacity(1024);
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_key_value_metadata(initial_kv.clone())
+                .build(),
+        );
+        let mut writer = SerializedFileWriter::new(&mut out, schema, props).unwrap();
+        let mut row_group_writer = writer.next_row_group().unwrap();
+        let column = row_group_writer.next_column().unwrap().unwrap();
+        column.close().unwrap();
+        row_group_writer.close().unwrap();
+        if let Some(kvs) = &final_kv {
+            for kv in kvs {
+                writer.append_key_value_metadata(kv.clone())
+            }
+        }
+        writer.close().unwrap();
+
+        let reader = SerializedFileReader::new(Bytes::from(out)).unwrap();
+        let metadata = reader.metadata().file_metadata();
+        let keys = metadata.key_value_metadata();
+
+        match (initial_kv, final_kv) {
+            (Some(a), Some(b)) => {
+                let keys = keys.unwrap();
+                assert_eq!(keys.len(), a.len() + b.len());
+                assert_eq!(&keys[..a.len()], a.as_slice());
+                assert_eq!(&keys[a.len()..], b.as_slice());
+            }
+            (Some(v), None) => assert_eq!(keys.unwrap(), &v),
+            (None, Some(v)) if !v.is_empty() => assert_eq!(keys.unwrap(), &v),
+            _ => assert!(keys.is_none()),
+        }
+    }
+
+    #[test]
+    fn test_append_metadata() {
+        let kv1 = KeyValue::new("cupcakes".to_string(), "awesome".to_string());
+        let kv2 = KeyValue::new("bingo".to_string(), "bongo".to_string());
+
+        test_kv_metadata(None, None);
+        test_kv_metadata(Some(vec![kv1.clone()]), None);
+        test_kv_metadata(None, Some(vec![kv2.clone()]));
+        test_kv_metadata(Some(vec![kv1.clone()]), Some(vec![kv2.clone()]));
+        test_kv_metadata(Some(vec![]), Some(vec![kv2]));
+        test_kv_metadata(Some(vec![]), Some(vec![]));
+        test_kv_metadata(Some(vec![kv1]), Some(vec![]));
+        test_kv_metadata(None, Some(vec![]));
+    }
+
+    #[test]
+    fn test_backwards_compatible_statistics() {
+        let message_type = "
+            message test_schema {
+                REQUIRED INT32 decimal1 (DECIMAL(8,2));
+                REQUIRED INT32 i32 (INTEGER(32,true));
+                REQUIRED INT32 u32 (INTEGER(32,false));
+            }
+        ";
+
+        let schema = Arc::new(parse_message_type(message_type).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut writer = SerializedFileWriter::new(vec![], schema, props).unwrap();
+        let mut row_group_writer = writer.next_row_group().unwrap();
+
+        for _ in 0..3 {
+            let mut writer = row_group_writer.next_column().unwrap().unwrap();
+            writer
+                .typed::<Int32Type>()
+                .write_batch(&[1, 2, 3], None, None)
+                .unwrap();
+            writer.close().unwrap();
+        }
+        let metadata = row_group_writer.close().unwrap();
+        writer.close().unwrap();
+
+        let thrift = metadata.to_thrift();
+        let encoded_stats: Vec<_> = thrift
+            .columns
+            .into_iter()
+            .map(|x| x.meta_data.unwrap().statistics.unwrap())
+            .collect();
+
+        // decimal
+        let s = &encoded_stats[0];
+        assert_eq!(s.min.as_deref(), Some(1_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.max.as_deref(), Some(3_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.min_value.as_deref(), Some(1_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.max_value.as_deref(), Some(3_i32.to_le_bytes().as_ref()));
+
+        // i32
+        let s = &encoded_stats[1];
+        assert_eq!(s.min.as_deref(), Some(1_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.max.as_deref(), Some(3_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.min_value.as_deref(), Some(1_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.max_value.as_deref(), Some(3_i32.to_le_bytes().as_ref()));
+
+        // u32
+        let s = &encoded_stats[2];
+        assert_eq!(s.min.as_deref(), None);
+        assert_eq!(s.max.as_deref(), None);
+        assert_eq!(s.min_value.as_deref(), Some(1_i32.to_le_bytes().as_ref()));
+        assert_eq!(s.max_value.as_deref(), Some(3_i32.to_le_bytes().as_ref()));
     }
 }
