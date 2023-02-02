@@ -17,7 +17,9 @@
 
 use arrow::util::pretty::print_batches;
 use futures::TryStreamExt;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter,
+};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::errors::Result;
 use perf_monitor;
@@ -30,51 +32,176 @@ use tokio::fs::File;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    // Create parquet file that will be read.
-    // let testdata = arrow::util::test_util::parquet_test_data();
+    if args.len() != 8 {
+        println!("Usage: cargo run --example filterscan <path> <filter_col_idx> <data_type> <filter_type> <v1> <v2> <proj_type>");
+        println!("Example: cargo run --example filterscan /tmp/tpch/lineitem.parquet 0 int point 1 none all");
+        println!("Example: cargo run --example filterscan /tmp/tpch/lineitem.parquet 0 int range 1 2 all");
+        println!("Example: cargo run --example filterscan /tmp/tpch/lineitem.parquet 0 int none 1 none all");
+        println!("Example: cargo run --example filterscan /tmp/tpch/lineitem.parquet 0 int none 1 none one");
+        return Ok(());
+    }
     let path = &args[1];
     let filter_col_idx = args[2].parse::<usize>().unwrap();
-    // let filter_col_val = String::from(&args[3]);
-    let filter_col_val = args[3].parse::<i32>().unwrap();
+    let data_type = String::from(&args[3]); // int, float, string
+    let filter_type = String::from(&args[4]); // point, range, none
+    let v1 = String::from(&args[5]);
+    let v2 = String::from(&args[6]);
+    let proj_type = String::from(&args[7]); // all, one
     let start = SystemTime::now();
     let file = File::open(path).await.unwrap();
 
-    // Create a async parquet reader builder with batch_size.
+    // Create an async parquet reader builder with batch_size.
     // batch_size is the number of rows to read up to buffer once from pages, defaults to 1024
-    let mut builder = ParquetRecordBatchStreamBuilder::new(file)
+    let options = ArrowReaderOptions::new().with_page_index(true);
+    let mut builder = ParquetRecordBatchStreamBuilder::new_with_options(file, options)
         .await
         .unwrap()
         .with_batch_size(1024);
 
     let file_metadata = builder.metadata().file_metadata().clone();
-    let mask = ProjectionMask::roots(
-        file_metadata.schema_descr(),
-        (0..15).collect::<Vec<usize>>(),
-    );
+    // let num_cols = file_metadata.schema_descr().num_columns();
+    let mask = if let "all" = proj_type.as_str() {
+        // Read all columns.
+        ProjectionMask::all()
+    } else {
+        // Read only filter column
+        ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx])
+    };
+
     // Set projection mask to read only root columns 1 and 2.
     builder = builder.with_projection(mask);
 
     // Highlight: set `RowFilter`, it'll push down filter predicates to skip IO and decode.
     // For more specific usage: please refer to https://github.com/apache/arrow-datafusion/blob/master/datafusion/core/src/physical_plan/file_format/parquet/row_filter.rs.
-    let filter = ArrowPredicateFn::new(
-        ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
-        move |record_batch| {
-            // arrow::compute::eq_dyn_utf8_scalar(record_batch.column(0), &filter_col_val)
-            arrow::compute::eq_dyn_scalar(record_batch.column(0), filter_col_val)
-            // arrow::compute::lt_eq_dyn_utf8_scalar(record_batch.column(0), &filter_col_val)
-        },
-    );
-    let row_filter = RowFilter::new(vec![Box::new(filter)]);
+    let mut filters: Vec<Box<dyn ArrowPredicate>> = vec![];
+    if filter_type == "none" {
+        // do nothing
+    } else if filter_type == "point" {
+        if data_type == "int" {
+            let filter_col_val = v1.parse::<i32>().unwrap();
+            let filter = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::eq_dyn_scalar(record_batch.column(0), filter_col_val)
+                },
+            );
+            filters.push(Box::new(filter));
+        } else if data_type == "float" {
+            let filter_col_val = v1.parse::<f64>().unwrap();
+            let filter = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::eq_dyn_scalar(record_batch.column(0), filter_col_val)
+                },
+            );
+            filters.push(Box::new(filter));
+        } else if data_type == "string" {
+            let filter_col_val = v1.parse::<String>().unwrap();
+            let filter = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::eq_dyn_utf8_scalar(
+                        record_batch.column(0),
+                        &filter_col_val,
+                    )
+                },
+            );
+            filters.push(Box::new(filter));
+        } else {
+            panic!("Unsupported data type");
+        }
+    } else if filter_type == "range" {
+        if data_type == "int" {
+            let filter_col_val1 = v1.parse::<i32>().unwrap();
+            let filter_col_val2 = v2.parse::<i32>().unwrap();
+            let filter1 = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::gt_eq_dyn_scalar(
+                        record_batch.column(0),
+                        filter_col_val1,
+                    )
+                },
+            );
+            let filter2 = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::lt_eq_dyn_scalar(
+                        record_batch.column(0),
+                        filter_col_val2,
+                    )
+                },
+            );
+            filters.push(Box::new(filter1));
+            filters.push(Box::new(filter2));
+        } else if data_type == "float" {
+            let filter_col_val1 = v1.parse::<f64>().unwrap();
+            let filter_col_val2 = v2.parse::<f64>().unwrap();
+            let filter1 = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::gt_eq_dyn_scalar(
+                        record_batch.column(0),
+                        filter_col_val1,
+                    )
+                },
+            );
+            let filter2 = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::lt_eq_dyn_scalar(
+                        record_batch.column(0),
+                        filter_col_val2,
+                    )
+                },
+            );
+            filters.push(Box::new(filter1));
+            filters.push(Box::new(filter2));
+        } else if data_type == "string" {
+            let filter_col_val1 = v1.parse::<String>().unwrap();
+            let filter_col_val2 = v2.parse::<String>().unwrap();
+            let filter1 = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::gt_eq_dyn_utf8_scalar(
+                        record_batch.column(0),
+                        &filter_col_val1,
+                    )
+                },
+            );
+            let filter2 = ArrowPredicateFn::new(
+                ProjectionMask::roots(file_metadata.schema_descr(), [filter_col_idx]),
+                move |record_batch| {
+                    arrow::compute::lt_eq_dyn_utf8_scalar(
+                        record_batch.column(0),
+                        &filter_col_val2,
+                    )
+                },
+            );
+            filters.push(Box::new(filter1));
+            filters.push(Box::new(filter2));
+        } else {
+            panic!("Unsupported data type");
+        }
+    } else {
+        panic!("Unsupported filter type");
+    }
+
+    let row_filter = RowFilter::new(filters);
     builder = builder.with_row_filter(row_filter);
 
     // Build a async parquet reader.
     let stream = builder.build().unwrap();
+    // println!(
+    //     "before collect: {} ms",
+    //     start.elapsed().unwrap().as_millis()
+    // );
 
-    let result = stream.try_collect::<Vec<_>>().await?;
+    let _result = stream.try_collect::<Vec<_>>().await?;
 
     println!("took: {} ms", start.elapsed().unwrap().as_millis());
 
-    print_batches(&result).unwrap();
+    // print_batches(&_result).unwrap();
 
     // let output = Command::new("/bin/cat")
     //     .arg("/proc/$PPID/io")
