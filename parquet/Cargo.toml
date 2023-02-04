@@ -152,6 +152,10 @@ required-features = ["cli"]
 name = "parquet-index"
 required-features = ["cli"]
 
+[[bin]]
+name = "parquet-filterscan-noeval"
+required-features = ["cli"]
+
 [[bench]]
 name = "arrow_writer"
 required-features = ["arrow"]
