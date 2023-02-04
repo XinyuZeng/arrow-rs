@@ -151,13 +151,16 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         (_, Decimal256(_, _)) => false,
         (Struct(_), _) => false,
         (_, Struct(_)) => false,
-        (_, Boolean) => DataType::is_numeric(from_type) || from_type == &Utf8,
-        (Boolean, _) => DataType::is_numeric(to_type) || to_type == &Utf8,
+        (_, Boolean) => DataType::is_numeric(from_type) || from_type == &Utf8 || from_type == &LargeUtf8,
+        (Boolean, _) => DataType::is_numeric(to_type) || to_type == &Utf8 || to_type == &LargeUtf8,
 
         (Utf8, LargeUtf8) => true,
         (LargeUtf8, Utf8) => true,
+        (Binary, LargeBinary) => true,
+        (LargeBinary, Binary) => true,
         (Utf8,
             Binary
+            | LargeBinary
             | Date32
             | Date64
             | Time32(TimeUnit::Second)
@@ -168,7 +171,8 @@ pub fn can_cast_types(from_type: &DataType, to_type: &DataType) -> bool {
         ) => true,
         (Utf8, _) => DataType::is_numeric(to_type) && to_type != &Float16,
         (LargeUtf8,
-            LargeBinary
+            Binary
+            | LargeBinary
             | Date32
             | Date64
             | Time32(TimeUnit::Second)
@@ -650,8 +654,7 @@ pub fn cast_with_options(
             UInt32 => dictionary_cast::<UInt32Type>(array, to_type, cast_options),
             UInt64 => dictionary_cast::<UInt64Type>(array, to_type, cast_options),
             _ => Err(ArrowError::CastError(format!(
-                "Casting from dictionary type {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from dictionary type {from_type:?} to {to_type:?} not supported",
             ))),
         },
         (_, Dictionary(index_type, value_type)) => match **index_type {
@@ -664,8 +667,7 @@ pub fn cast_with_options(
             UInt32 => cast_to_dictionary::<UInt32Type>(array, value_type, cast_options),
             UInt64 => cast_to_dictionary::<UInt64Type>(array, value_type, cast_options),
             _ => Err(ArrowError::CastError(format!(
-                "Casting from type {:?} to dictionary type {:?} not supported",
-                from_type, to_type,
+                "Casting from type {from_type:?} to dictionary type {to_type:?} not supported",
             ))),
         },
         (List(_), List(ref to)) => {
@@ -804,8 +806,7 @@ pub fn cast_with_options(
                 }
                 Null => Ok(new_null_array(to_type, array.len())),
                 _ => Err(ArrowError::CastError(format!(
-                    "Casting from {:?} to {:?} not supported",
-                    from_type, to_type
+                    "Casting from {from_type:?} to {to_type:?} not supported"
                 ))),
             }
         }
@@ -872,8 +873,7 @@ pub fn cast_with_options(
                 }
                 Null => Ok(new_null_array(to_type, array.len())),
                 _ => Err(ArrowError::CastError(format!(
-                    "Casting from {:?} to {:?} not supported",
-                    from_type, to_type
+                    "Casting from {from_type:?} to {to_type:?} not supported"
                 ))),
             }
         }
@@ -962,8 +962,7 @@ pub fn cast_with_options(
                 ),
                 Null => Ok(new_null_array(to_type, array.len())),
                 _ => Err(ArrowError::CastError(format!(
-                    "Casting from {:?} to {:?} not supported",
-                    from_type, to_type
+                    "Casting from {from_type:?} to {to_type:?} not supported"
                 ))),
             }
         }
@@ -1052,8 +1051,7 @@ pub fn cast_with_options(
                 ),
                 Null => Ok(new_null_array(to_type, array.len())),
                 _ => Err(ArrowError::CastError(format!(
-                    "Casting from {:?} to {:?} not supported",
-                    from_type, to_type
+                    "Casting from {from_type:?} to {to_type:?} not supported"
                 ))),
             }
         }
@@ -1075,10 +1073,10 @@ pub fn cast_with_options(
             Float16 => cast_numeric_to_bool::<Float16Type>(array),
             Float32 => cast_numeric_to_bool::<Float32Type>(array),
             Float64 => cast_numeric_to_bool::<Float64Type>(array),
-            Utf8 => cast_utf8_to_boolean(array, cast_options),
+            Utf8 => cast_utf8_to_boolean::<i32>(array, cast_options),
+            LargeUtf8 => cast_utf8_to_boolean::<i64>(array, cast_options),
             _ => Err(ArrowError::CastError(format!(
-                "Casting from {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from {from_type:?} to {to_type:?} not supported",
             ))),
         },
         (Boolean, _) => match to_type {
@@ -1102,13 +1100,21 @@ pub fn cast_with_options(
                         .collect::<StringArray>(),
                 ))
             }
+            LargeUtf8 => {
+                let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                Ok(Arc::new(
+                    array
+                        .iter()
+                        .map(|value| value.map(|value| if value { "1" } else { "0" }))
+                        .collect::<LargeStringArray>(),
+                ))
+            }
             _ => Err(ArrowError::CastError(format!(
-                "Casting from {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from {from_type:?} to {to_type:?} not supported",
             ))),
         },
         (Utf8, _) => match to_type {
-            LargeUtf8 => cast_str_container::<i32, i64>(&**array),
+            LargeUtf8 => cast_byte_container::<Utf8Type, LargeUtf8Type, str>(&**array),
             UInt8 => cast_string_to_numeric::<UInt8Type, i32>(array, cast_options),
             UInt16 => cast_string_to_numeric::<UInt16Type, i32>(array, cast_options),
             UInt32 => cast_string_to_numeric::<UInt32Type, i32>(array, cast_options),
@@ -1121,7 +1127,11 @@ pub fn cast_with_options(
             Float64 => cast_string_to_numeric::<Float64Type, i32>(array, cast_options),
             Date32 => cast_string_to_date32::<i32>(&**array, cast_options),
             Date64 => cast_string_to_date64::<i32>(&**array, cast_options),
-            Binary => cast_string_to_binary(array),
+            Binary => Ok(Arc::new(BinaryArray::from(as_string_array(array).clone()))),
+            LargeBinary => {
+                let binary = BinaryArray::from(as_string_array(array).clone());
+                cast_byte_container::<BinaryType, LargeBinaryType, [u8]>(&binary)
+            }
             Time32(TimeUnit::Second) => {
                 cast_string_to_time32second::<i32>(&**array, cast_options)
             }
@@ -1138,12 +1148,11 @@ pub fn cast_with_options(
                 cast_string_to_timestamp_ns::<i32>(&**array, cast_options)
             }
             _ => Err(ArrowError::CastError(format!(
-                "Casting from {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from {from_type:?} to {to_type:?} not supported",
             ))),
         },
         (_, Utf8) => match from_type {
-            LargeUtf8 => cast_str_container::<i64, i32>(&**array),
+            LargeUtf8 => cast_byte_container::<LargeUtf8Type, Utf8Type, str>(&**array),
             UInt8 => cast_numeric_to_string::<UInt8Type, i32>(array),
             UInt16 => cast_numeric_to_string::<UInt16Type, i32>(array),
             UInt32 => cast_numeric_to_string::<UInt32Type, i32>(array),
@@ -1196,8 +1205,7 @@ pub fn cast_with_options(
                 ))
             }
             _ => Err(ArrowError::CastError(format!(
-                "Casting from {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from {from_type:?} to {to_type:?} not supported",
             ))),
         },
         (_, LargeUtf8) => match from_type {
@@ -1253,8 +1261,7 @@ pub fn cast_with_options(
                 ))
             }
             _ => Err(ArrowError::CastError(format!(
-                "Casting from {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from {from_type:?} to {to_type:?} not supported",
             ))),
         },
         (LargeUtf8, _) => match to_type {
@@ -1270,7 +1277,14 @@ pub fn cast_with_options(
             Float64 => cast_string_to_numeric::<Float64Type, i64>(array, cast_options),
             Date32 => cast_string_to_date32::<i64>(&**array, cast_options),
             Date64 => cast_string_to_date64::<i64>(&**array, cast_options),
-            LargeBinary => cast_string_to_binary(array),
+            Binary => {
+                let large_binary =
+                    LargeBinaryArray::from(as_largestring_array(array).clone());
+                cast_byte_container::<LargeBinaryType, BinaryType, [u8]>(&large_binary)
+            }
+            LargeBinary => Ok(Arc::new(LargeBinaryArray::from(
+                as_largestring_array(array).clone(),
+            ))),
             Time32(TimeUnit::Second) => {
                 cast_string_to_time32second::<i64>(&**array, cast_options)
             }
@@ -1287,11 +1301,23 @@ pub fn cast_with_options(
                 cast_string_to_timestamp_ns::<i64>(&**array, cast_options)
             }
             _ => Err(ArrowError::CastError(format!(
-                "Casting from {:?} to {:?} not supported",
-                from_type, to_type,
+                "Casting from {from_type:?} to {to_type:?} not supported",
             ))),
         },
-
+        (Binary, _) => match to_type {
+            LargeBinary => {
+                cast_byte_container::<BinaryType, LargeBinaryType, [u8]>(&**array)
+            }
+            _ => Err(ArrowError::CastError(format!(
+                "Casting from {from_type:?} to {to_type:?} not supported",
+            ))),
+        },
+        (LargeBinary, _) => match to_type {
+            Binary => cast_byte_container::<LargeBinaryType, BinaryType, [u8]>(&**array),
+            _ => Err(ArrowError::CastError(format!(
+                "Casting from {from_type:?} to {to_type:?} not supported",
+            ))),
+        },
         // start numeric casts
         (UInt8, UInt16) => {
             cast_numeric_arrays::<UInt8Type, UInt16Type>(array, cast_options)
@@ -2001,43 +2027,7 @@ pub fn cast_with_options(
             cast_reinterpret_arrays::<Int64Type, IntervalDayTimeType>(array)
         }
         (_, _) => Err(ArrowError::CastError(format!(
-            "Casting from {:?} to {:?} not supported",
-            from_type, to_type,
-        ))),
-    }
-}
-
-/// Cast to string array to binary array
-fn cast_string_to_binary(array: &ArrayRef) -> Result<ArrayRef, ArrowError> {
-    let from_type = array.data_type();
-    match *from_type {
-        DataType::Utf8 => {
-            let data = unsafe {
-                array
-                    .data()
-                    .clone()
-                    .into_builder()
-                    .data_type(DataType::Binary)
-                    .build_unchecked()
-            };
-
-            Ok(Arc::new(BinaryArray::from(data)) as ArrayRef)
-        }
-        DataType::LargeUtf8 => {
-            let data = unsafe {
-                array
-                    .data()
-                    .clone()
-                    .into_builder()
-                    .data_type(DataType::LargeBinary)
-                    .build_unchecked()
-            };
-
-            Ok(Arc::new(LargeBinaryArray::from(data)) as ArrayRef)
-        }
-        _ => Err(ArrowError::InvalidArgumentError(format!(
-            "{:?} cannot be converted to binary array",
-            from_type
+            "Casting from {from_type:?} to {to_type:?} not supported",
         ))),
     }
 }
@@ -2843,11 +2833,17 @@ fn cast_string_to_timestamp_ns<Offset: OffsetSizeTrait>(
 }
 
 /// Casts Utf8 to Boolean
-fn cast_utf8_to_boolean(
+fn cast_utf8_to_boolean<OffsetSize>(
     from: &ArrayRef,
     cast_options: &CastOptions,
-) -> Result<ArrayRef, ArrowError> {
-    let array = as_string_array(from);
+) -> Result<ArrayRef, ArrowError>
+where
+    OffsetSize: OffsetSizeTrait,
+{
+    let array = from
+        .as_any()
+        .downcast_ref::<GenericStringArray<OffsetSize>>()
+        .unwrap();
 
     let output_array = array
         .iter()
@@ -2861,8 +2857,7 @@ fn cast_utf8_to_boolean(
                 invalid_value => match cast_options.safe {
                     true => Ok(None),
                     false => Err(ArrowError::CastError(format!(
-                        "Cannot cast string '{}' to value of Boolean type",
-                        invalid_value,
+                        "Cannot cast value '{invalid_value}' to value of Boolean type",
                     ))),
                 },
             },
@@ -2886,8 +2881,7 @@ where
     let parts: Vec<&str> = value_str.split('.').collect();
     if parts.len() > 2 {
         return Err(ArrowError::InvalidArgumentError(format!(
-            "Invalid decimal format: {:?}",
-            value_str
+            "Invalid decimal format: {value_str:?}"
         )));
     }
 
@@ -2898,8 +2892,7 @@ where
     let number_decimals = if decimals.len() > scale {
         let decimal_number = i256::from_string(decimals).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!(
-                "Cannot parse decimal format: {}",
-                value_str
+                "Cannot parse decimal format: {value_str}"
             ))
         })?;
 
@@ -2923,8 +2916,7 @@ where
             i256::from_string(integers)
                 .ok_or_else(|| {
                     ArrowError::InvalidArgumentError(format!(
-                        "Cannot parse decimal format: {}",
-                        value_str
+                        "Cannot parse decimal format: {value_str}"
                     ))
                 })
                 .map(|v| {
@@ -2938,8 +2930,8 @@ where
     } else {
         let padding = if scale > decimals.len() { scale } else { 0 };
 
-        let decimals = format!("{:0<width$}", decimals, width = padding);
-        format!("{}{}", integers, decimals)
+        let decimals = format!("{decimals:0<padding$}");
+        format!("{integers}{decimals}")
     };
 
     let value = i256::from_string(number_decimals.as_str()).ok_or_else(|| {
@@ -3021,8 +3013,7 @@ where
 {
     if scale < 0 {
         return Err(ArrowError::InvalidArgumentError(format!(
-            "Cannot cast string to decimal with negative scale {}",
-            scale
+            "Cannot cast string to decimal with negative scale {scale}"
         )));
     }
 
@@ -3188,8 +3179,7 @@ fn dictionary_cast<K: ArrowDictionaryKeyType>(
                 UInt64 => Arc::new(DictionaryArray::<UInt64Type>::from(data)),
                 _ => {
                     return Err(ArrowError::CastError(format!(
-                        "Unsupported type {:?} for dictionary index",
-                        to_index_type
+                        "Unsupported type {to_index_type:?} for dictionary index"
                     )));
                 }
             };
@@ -3301,11 +3291,18 @@ fn cast_to_dictionary<K: ArrowDictionaryKeyType>(
             dict_value_type,
             cast_options,
         ),
-        Utf8 => pack_string_to_dictionary::<K>(array, cast_options),
-        LargeUtf8 => pack_string_to_dictionary::<K>(array, cast_options),
+        Utf8 => pack_byte_to_dictionary::<K, GenericStringType<i32>>(array, cast_options),
+        LargeUtf8 => {
+            pack_byte_to_dictionary::<K, GenericStringType<i64>>(array, cast_options)
+        }
+        Binary => {
+            pack_byte_to_dictionary::<K, GenericBinaryType<i32>>(array, cast_options)
+        }
+        LargeBinary => {
+            pack_byte_to_dictionary::<K, GenericBinaryType<i64>>(array, cast_options)
+        }
         _ => Err(ArrowError::CastError(format!(
-            "Unsupported output type for dictionary packing: {:?}",
-            dict_value_type
+            "Unsupported output type for dictionary packing: {dict_value_type:?}"
         ))),
     }
 }
@@ -3342,18 +3339,23 @@ where
     Ok(Arc::new(b.finish()))
 }
 
-// Packs the data as a StringDictionaryArray, if possible, with the
+// Packs the data as a GenericByteDictionaryBuilder, if possible, with the
 // key types of K
-fn pack_string_to_dictionary<K>(
+fn pack_byte_to_dictionary<K, T>(
     array: &ArrayRef,
     cast_options: &CastOptions,
 ) -> Result<ArrayRef, ArrowError>
 where
     K: ArrowDictionaryKeyType,
+    T: ByteArrayType,
 {
-    let cast_values = cast_with_options(array, &DataType::Utf8, cast_options)?;
-    let values = cast_values.as_any().downcast_ref::<StringArray>().unwrap();
-    let mut b = StringDictionaryBuilder::<K>::with_capacity(values.len(), 1024, 1024);
+    let cast_values = cast_with_options(array, &T::DATA_TYPE, cast_options)?;
+    let values = cast_values
+        .as_any()
+        .downcast_ref::<GenericByteArray<T>>()
+        .unwrap();
+    let mut b =
+        GenericByteDictionaryBuilder::<K, T>::with_capacity(values.len(), 1024, 1024);
 
     // copy each element one at a time
     for i in 0..values.len() {
@@ -3434,39 +3436,43 @@ fn cast_list_inner<OffsetSize: OffsetSizeTrait>(
     Ok(Arc::new(list) as ArrayRef)
 }
 
-/// Helper function to cast from `Utf8` to `LargeUtf8` and vice versa. If the `LargeUtf8` is too large for
-/// a `Utf8` array it will return an Error.
-fn cast_str_container<OffsetSizeFrom, OffsetSizeTo>(
+/// Helper function to cast from one `ByteArrayType` to another and vice versa.
+/// If the target one (e.g., `LargeUtf8`) is too large for the source array it will return an Error.
+fn cast_byte_container<FROM, TO, N: ?Sized>(
     array: &dyn Array,
 ) -> Result<ArrayRef, ArrowError>
 where
-    OffsetSizeFrom: OffsetSizeTrait + ToPrimitive,
-    OffsetSizeTo: OffsetSizeTrait + NumCast + ArrowNativeType,
+    FROM: ByteArrayType<Native = N>,
+    TO: ByteArrayType<Native = N>,
+    FROM::Offset: OffsetSizeTrait + ToPrimitive,
+    TO::Offset: OffsetSizeTrait + NumCast,
 {
     let data = array.data();
-    assert_eq!(
-        data.data_type(),
-        &GenericStringArray::<OffsetSizeFrom>::DATA_TYPE
-    );
+    assert_eq!(data.data_type(), &FROM::DATA_TYPE);
     let str_values_buf = data.buffers()[1].clone();
-    let offsets = data.buffers()[0].typed_data::<OffsetSizeFrom>();
+    let offsets = data.buffers()[0].typed_data::<FROM::Offset>();
 
-    let mut offset_builder = BufferBuilder::<OffsetSizeTo>::new(offsets.len());
+    let mut offset_builder = BufferBuilder::<TO::Offset>::new(offsets.len());
     offsets
         .iter()
         .try_for_each::<_, Result<_, ArrowError>>(|offset| {
-            let offset = OffsetSizeTo::from(*offset).ok_or_else(|| {
-                ArrowError::ComputeError(
-                    "large-utf8 array too large to cast to utf8-array".into(),
-                )
-            })?;
+            let offset = <<TO as ByteArrayType>::Offset as NumCast>::from(*offset)
+                .ok_or_else(|| {
+                    ArrowError::ComputeError(format!(
+                        "{}{} array too large to cast to {}{} array",
+                        FROM::Offset::PREFIX,
+                        FROM::PREFIX,
+                        TO::Offset::PREFIX,
+                        TO::PREFIX
+                    ))
+                })?;
             offset_builder.append(offset);
             Ok(())
         })?;
 
     let offset_buffer = offset_builder.finish();
 
-    let dtype = GenericStringArray::<OffsetSizeTo>::DATA_TYPE;
+    let dtype = TO::DATA_TYPE;
 
     let builder = ArrayData::builder(dtype)
         .offset(array.offset())
@@ -3477,9 +3483,7 @@ where
 
     let array_data = unsafe { builder.build_unchecked() };
 
-    Ok(Arc::new(GenericStringArray::<OffsetSizeTo>::from(
-        array_data,
-    )))
+    Ok(Arc::new(GenericByteArray::<TO>::from(array_data)))
 }
 
 /// Cast the container type of List/Largelist array but not the inner types.
@@ -4683,8 +4687,7 @@ mod tests {
         assert_eq!(1, arr.value_length(2));
         assert_eq!(1, arr.value_length(3));
         assert_eq!(1, arr.value_length(4));
-        let values = arr.values();
-        let c = values.as_any().downcast_ref::<Int32Array>().unwrap();
+        let c = as_primitive_array::<Int32Type>(arr.values());
         assert_eq!(5, c.value(0));
         assert_eq!(6, c.value(1));
         assert_eq!(7, c.value(2));
@@ -4710,8 +4713,8 @@ mod tests {
         assert_eq!(1, arr.value_length(2));
         assert_eq!(1, arr.value_length(3));
         assert_eq!(1, arr.value_length(4));
-        let values = arr.values();
-        let c = values.as_any().downcast_ref::<Int32Array>().unwrap();
+
+        let c = as_primitive_array::<Int32Type>(arr.values());
         assert_eq!(1, c.null_count());
         assert_eq!(5, c.value(0));
         assert!(!c.is_valid(1));
@@ -4738,8 +4741,7 @@ mod tests {
         assert_eq!(1, arr.value_length(1));
         assert_eq!(1, arr.value_length(2));
         assert_eq!(1, arr.value_length(3));
-        let values = arr.values();
-        let c = values.as_any().downcast_ref::<Float64Array>().unwrap();
+        let c = as_primitive_array::<Float64Type>(arr.values());
         assert_eq!(1, c.null_count());
         assert_eq!(7.0, c.value(0));
         assert_eq!(8.0, c.value(1));
@@ -4773,8 +4775,7 @@ mod tests {
                     e.to_string().contains(
                         "Cast error: Cannot cast string 'seven' to value of Int32 type",
                     ),
-                    "Error: {}",
-                    e
+                    "Error: {e}"
                 )
             }
         }
@@ -4802,7 +4803,7 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => {
                 assert!(e.to_string().contains(
-                    "Cast error: Cannot cast string 'invalid' to value of Boolean type"
+                    "Cast error: Cannot cast value 'invalid' to value of Boolean type"
                 ))
             }
         }
@@ -4888,9 +4889,8 @@ mod tests {
         assert_eq!(2, array.value_length(2));
 
         // expect 4 nulls: negative numbers and overflow
-        let values = array.values();
-        assert_eq!(4, values.null_count());
-        let u16arr = values.as_any().downcast_ref::<UInt16Array>().unwrap();
+        let u16arr = as_primitive_array::<UInt16Type>(array.values());
+        assert_eq!(4, u16arr.null_count());
 
         // expect 4 nulls: negative numbers and overflow
         let expected: UInt16Array =
@@ -6666,13 +6666,11 @@ mod tests {
         let cast_type = Dictionary(Box::new(Int8), Box::new(Utf8));
         let res = cast(&array, &cast_type);
         assert!(res.is_err());
-        let actual_error = format!("{:?}", res);
+        let actual_error = format!("{res:?}");
         let expected_error = "Could not convert 72 dictionary indexes from Int32 to Int8";
         assert!(
             actual_error.contains(expected_error),
-            "did not find expected error '{}' in actual error '{}'",
-            actual_error,
-            expected_error
+            "did not find expected error '{actual_error}' in actual error '{expected_error}'"
         );
     }
 
@@ -6688,7 +6686,7 @@ mod tests {
         // dictionary indexed by int32, but not a dictionary indexed
         // with int8)
         for i in 0..200 {
-            let val = format!("val{}", i);
+            let val = format!("val{i}");
             builder.append(&val).unwrap();
         }
         let array: ArrayRef = Arc::new(builder.finish());
@@ -6696,13 +6694,11 @@ mod tests {
         let cast_type = Dictionary(Box::new(Int8), Box::new(Utf8));
         let res = cast(&array, &cast_type);
         assert!(res.is_err());
-        let actual_error = format!("{:?}", res);
+        let actual_error = format!("{res:?}");
         let expected_error = "Could not convert 72 dictionary indexes from Int32 to Int8";
         assert!(
             actual_error.contains(expected_error),
-            "did not find expected error '{}' in actual error '{}'",
-            actual_error,
-            expected_error
+            "did not find expected error '{actual_error}' in actual error '{expected_error}'"
         );
     }
 
@@ -7242,9 +7238,7 @@ mod tests {
         let expected_error = "Cast error: Cannot cast to Decimal128(38, 30)";
         assert!(
             err.contains(expected_error),
-            "did not find expected error '{}' in actual error '{}'",
-            expected_error,
-            err
+            "did not find expected error '{expected_error}' in actual error '{err}'"
         );
     }
 
@@ -7269,9 +7263,7 @@ mod tests {
         let expected_error = "Cast error: Cannot cast to Decimal256(76, 50)";
         assert!(
             err.contains(expected_error),
-            "did not find expected error '{}' in actual error '{}'",
-            expected_error,
-            err
+            "did not find expected error '{expected_error}' in actual error '{err}'"
         );
     }
 

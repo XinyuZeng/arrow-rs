@@ -410,6 +410,7 @@ impl Field {
             | DataType::List(_)
             | DataType::Map(_, _)
             | DataType::Dictionary(_, _)
+            | DataType::RunEndEncoded(_, _)
             | DataType::FixedSizeList(_, _)
             | DataType::FixedSizeBinary(_)
             | DataType::Utf8
@@ -475,7 +476,7 @@ impl Field {
 // TODO: improve display with crate https://crates.io/crates/derive_more ?
 impl std::fmt::Display for Field {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 

@@ -118,8 +118,7 @@ impl IpcWriteOptions {
                 }
             }
             z => Err(ArrowError::InvalidArgumentError(format!(
-                "Unsupported crate::MetadataVersion {:?}",
-                z
+                "Unsupported crate::MetadataVersion {z:?}"
             ))),
         }
     }
@@ -223,7 +222,7 @@ impl IpcDataGenerator {
                 let list = as_list_array(column);
                 self.encode_dictionaries(
                     field,
-                    &list.values(),
+                    list.values(),
                     encoded_dictionaries,
                     dictionary_tracker,
                     write_options,
@@ -233,7 +232,7 @@ impl IpcDataGenerator {
                 let list = as_large_list_array(column);
                 self.encode_dictionaries(
                     field,
-                    &list.values(),
+                    list.values(),
                     encoded_dictionaries,
                     dictionary_tracker,
                     write_options,
@@ -962,7 +961,7 @@ fn write_continuation<W: Write>(
             writer.write_all(&CONTINUATION_MARKER)?;
             writer.write_all(&total_len.to_le_bytes()[..])?;
         }
-        z => panic!("Unsupported crate::MetadataVersion {:?}", z),
+        z => panic!("Unsupported crate::MetadataVersion {z:?}"),
     };
 
     writer.flush()?;
@@ -1296,8 +1295,7 @@ fn write_buffer(
     .try_into()
     .map_err(|e| {
         ArrowError::InvalidArgumentError(format!(
-            "Could not convert compressed size to i64: {}",
-            e
+            "Could not convert compressed size to i64: {e}"
         ))
     })?;
 

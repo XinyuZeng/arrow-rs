@@ -169,20 +169,22 @@ impl AzureClient {
             CredentialProvider::AccessKey(key) => {
                 Ok(AzureCredential::AccessKey(key.to_owned()))
             }
-            CredentialProvider::ClientSecret(cred) => {
-                let token = cred
-                    .fetch_token(&self.client, &self.config.retry_config)
+            CredentialProvider::TokenCredential(cache, cred) => {
+                let token = cache
+                    .get_or_insert_with(|| {
+                        cred.fetch_token(&self.client, &self.config.retry_config)
+                    })
                     .await
                     .context(AuthorizationSnafu)?;
                 Ok(AzureCredential::AuthorizationToken(
                     // we do the conversion to a HeaderValue here, since it is fallible
                     // and we wna to use it in an infallible function
-                    HeaderValue::from_str(&format!("Bearer {}", token)).map_err(
-                        |err| crate::Error::Generic {
+                    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|err| {
+                        crate::Error::Generic {
                             store: "MicrosoftAzure",
                             source: Box::new(err),
-                        },
-                    )?,
+                        }
+                    })?,
                 ))
             }
             CredentialProvider::SASToken(sas) => {
