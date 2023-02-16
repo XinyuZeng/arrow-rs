@@ -84,7 +84,7 @@ use parquet::{
     basic::Compression,
     errors::ParquetError,
     file::properties::{WriterProperties, WriterVersion},
-    schema::{parser::parse_message_type, types::SchemaDescriptor},
+    schema::{parser::parse_message_type, types::ColumnPath, types::SchemaDescriptor},
 };
 
 #[derive(Debug)]
@@ -204,6 +204,10 @@ struct Args {
     max_row_group_size: Option<usize>,
     #[clap(long, help("whether to enable bloom filter writing"))]
     enable_bloom_filter: Option<bool>,
+    #[clap(long, help("target bf col"))]
+    bf_col: Option<String>,
+    #[clap(long, help("fpp"))]
+    fpp: Option<f64>,
 
     #[clap(long, action=clap::ArgAction::Help, help("display usage help"))]
     help: Option<bool>,
@@ -297,6 +301,14 @@ fn configure_writer_properties(args: &Args) -> WriterProperties {
     if let Some(enable_bloom_filter) = args.enable_bloom_filter {
         properties_builder =
             properties_builder.set_bloom_filter_enabled(enable_bloom_filter);
+    }
+    if let Some(bf_col) = &args.bf_col {
+        properties_builder = properties_builder
+            .set_column_bloom_filter_enabled(ColumnPath::from(bf_col.as_str()), true);
+        if let Some(fpp) = args.fpp {
+            properties_builder = properties_builder
+                .set_column_bloom_filter_fpp(ColumnPath::from(bf_col.as_str()), fpp);
+        }
     }
     properties_builder.build()
 }

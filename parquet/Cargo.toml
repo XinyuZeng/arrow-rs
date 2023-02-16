@@ -160,6 +160,14 @@ required-features = ["cli"]
 name = "parquet-test-single-col"
 required-features = ["cli"]
 
+[[bin]]
+name = "parquet-scan"
+required-features = ["cli"]
+
+[[bin]]
+name = "parquet-bf"
+required-features = ["cli"]
+
 [[bench]]
 name = "arrow_writer"
 required-features = ["arrow"]

@@ -57,15 +57,12 @@ use std::{fs::File, path::Path};
 struct Args {
     #[clap(short, long, help("Path to a parquet file, or - for stdin"))]
     file_name: String,
-    #[clap(short('i'), long, help("Column idx to filter"))]
-    filter_col_idx: usize,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let filename = args.file_name;
-    let filter_col_idx = args.filter_col_idx;
     let batch_size: usize = 1024;
 
     let mut values_i64: Vec<i64> = vec![0; batch_size];
@@ -94,81 +91,80 @@ fn main() -> Result<()> {
         let row_group_reader = reader.get_row_group(i).unwrap();
         let row_group_metadata = metadata.row_group(i);
 
-        // for j in 0..row_group_metadata.num_columns() {
-        let mut column_reader =
-            row_group_reader.get_column_reader(filter_col_idx).unwrap();
-        match column_reader {
-            ColumnReader::ByteArrayColumnReader(ref mut typed_reader) => {
-                loop {
-                    let mut read_records = 0;
-                    // NOTE(xinyu): logic from arrow_reader/mod.rs:480
-                    match typed_reader.read_batch(
-                        batch_size,
-                        Some(&mut def_levels),
-                        Some(&mut rep_levels),
-                        &mut values_str,
-                    ) {
-                        Ok((_, 0)) => break,
-                        Ok((_, rec)) => {
-                            read_records += rec;
-                            total_decoded += rec;
+        for j in 0..row_group_metadata.num_columns() {
+            let mut column_reader = row_group_reader.get_column_reader(j).unwrap();
+            match column_reader {
+                ColumnReader::ByteArrayColumnReader(ref mut typed_reader) => {
+                    loop {
+                        let mut read_records = 0;
+                        // NOTE(xinyu): logic from arrow_reader/mod.rs:480
+                        match typed_reader.read_batch(
+                            batch_size,
+                            Some(&mut def_levels),
+                            Some(&mut rep_levels),
+                            &mut values_str,
+                        ) {
+                            Ok((_, 0)) => break,
+                            Ok((_, rec)) => {
+                                read_records += rec;
+                                total_decoded += rec;
+                            }
+                            Err(error) => return Err(error.into()),
                         }
-                        Err(error) => return Err(error.into()),
-                    }
-                    if read_records == 0 {
-                        break;
+                        if read_records == 0 {
+                            break;
+                        }
                     }
                 }
-            }
-            ColumnReader::Int64ColumnReader(ref mut typed_reader) => {
-                loop {
-                    let mut read_records = 0;
-                    // NOTE(xinyu): logic from arrow_reader/mod.rs:480
-                    match typed_reader.read_batch(
-                        batch_size,
-                        Some(&mut def_levels),
-                        Some(&mut rep_levels),
-                        &mut values_i64,
-                    ) {
-                        Ok((_, 0)) => break,
-                        Ok((_, rec)) => {
-                            read_records += rec;
-                            total_decoded += rec;
+                ColumnReader::Int64ColumnReader(ref mut typed_reader) => {
+                    loop {
+                        let mut read_records = 0;
+                        // NOTE(xinyu): logic from arrow_reader/mod.rs:480
+                        match typed_reader.read_batch(
+                            batch_size,
+                            Some(&mut def_levels),
+                            Some(&mut rep_levels),
+                            &mut values_i64,
+                        ) {
+                            Ok((_, 0)) => break,
+                            Ok((_, rec)) => {
+                                read_records += rec;
+                                total_decoded += rec;
+                            }
+                            Err(error) => return Err(error.into()),
                         }
-                        Err(error) => return Err(error.into()),
-                    }
-                    if read_records == 0 {
-                        break;
+                        if read_records == 0 {
+                            break;
+                        }
                     }
                 }
-            }
-            ColumnReader::DoubleColumnReader(ref mut typed_reader) => {
-                loop {
-                    let mut read_records = 0;
-                    // NOTE(xinyu): logic from arrow_reader/mod.rs:480
-                    match typed_reader.read_batch(
-                        batch_size,
-                        Some(&mut def_levels),
-                        Some(&mut rep_levels),
-                        &mut values_double,
-                    ) {
-                        Ok((_, 0)) => break,
-                        Ok((_, rec)) => {
-                            read_records += rec;
-                            total_decoded += rec;
+                ColumnReader::DoubleColumnReader(ref mut typed_reader) => {
+                    loop {
+                        let mut read_records = 0;
+                        // NOTE(xinyu): logic from arrow_reader/mod.rs:480
+                        match typed_reader.read_batch(
+                            batch_size,
+                            Some(&mut def_levels),
+                            Some(&mut rep_levels),
+                            &mut values_double,
+                        ) {
+                            Ok((_, 0)) => break,
+                            Ok((_, rec)) => {
+                                read_records += rec;
+                                total_decoded += rec;
+                            }
+                            Err(error) => return Err(error.into()),
                         }
-                        Err(error) => return Err(error.into()),
-                    }
-                    if read_records == 0 {
-                        break;
+                        if read_records == 0 {
+                            break;
+                        }
                     }
                 }
-            }
-            _ => {
-                println!("not supported")
+                _ => {
+                    println!("not supported")
+                }
             }
         }
-        // }
     }
     println!("took: {} ms", start.elapsed().unwrap().as_millis());
 
