@@ -27,7 +27,7 @@ use tokio::fs::File;
 async fn main() -> Result<()> {
     // Create parquet file that will be read.
     let testdata = arrow::util::test_util::parquet_test_data();
-    let path = format!("{}/alltypes_plain.parquet", testdata);
+    let path = format!("{}/lineitem_1M_shipdate_nobf.parquet", testdata);
     let file = File::open(path).await.unwrap();
 
     // Create a async parquet reader builder with batch_size.
@@ -35,18 +35,23 @@ async fn main() -> Result<()> {
     let mut builder = ParquetRecordBatchStreamBuilder::new(file)
         .await
         .unwrap()
-        .with_batch_size(8192);
+        .with_batch_size(2000);
 
     let file_metadata = builder.metadata().file_metadata().clone();
-    let mask = ProjectionMask::roots(file_metadata.schema_descr(), [0, 1, 2]);
+    let mask = ProjectionMask::roots(
+        file_metadata.schema_descr(),
+        (0..15).collect::<Vec<usize>>(),
+    );
     // Set projection mask to read only root columns 1 and 2.
     builder = builder.with_projection(mask);
 
     // Highlight: set `RowFilter`, it'll push down filter predicates to skip IO and decode.
     // For more specific usage: please refer to https://github.com/apache/arrow-datafusion/blob/master/datafusion/core/src/physical_plan/file_format/parquet/row_filter.rs.
     let filter = ArrowPredicateFn::new(
-        ProjectionMask::roots(file_metadata.schema_descr(), [0]),
-        |record_batch| arrow::compute::eq_dyn_scalar(record_batch.column(0), 1),
+        ProjectionMask::roots(file_metadata.schema_descr(), [10]),
+        |record_batch| {
+            arrow::compute::lt_eq_dyn_utf8_scalar(record_batch.column(0), "1992-01-31")
+        },
     );
     let row_filter = RowFilter::new(vec![Box::new(filter)]);
     builder = builder.with_row_filter(row_filter);
@@ -60,7 +65,7 @@ async fn main() -> Result<()> {
 
     println!("took: {} ms", start.elapsed().unwrap().as_millis());
 
-    print_batches(&result).unwrap();
+    // print_batches(&result).unwrap();
 
     Ok(())
 }

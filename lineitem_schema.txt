@@ -1,0 +1,18 @@
+required group field_id=-1 schema {
+  optional int64 field_id=-1 l_orderkey;
+  optional int64 field_id=-1 l_partkey;
+  optional int64 field_id=-1 l_suppkey;
+  optional int64 field_id=-1 l_linenumber;
+  optional int64 field_id=-1 l_quantity;
+  optional double field_id=-1 l_extendedprice;
+  optional double field_id=-1 l_discount;
+  optional double field_id=-1 l_tax;
+  optional binary field_id=-1 l_returnflag (String);
+  optional binary field_id=-1 l_linestatus (String);
+  optional binary field_id=-1 l_shipdate (String);
+  optional binary field_id=-1 l_commitdate (String);
+  optional binary field_id=-1 l_receiptdate (String);
+  optional binary field_id=-1 l_shipinstruct (String);
+  optional binary field_id=-1 l_shipmode (String);
+  optional binary field_id=-1 l_comment (String);
+}
