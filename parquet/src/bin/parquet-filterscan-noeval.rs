@@ -63,6 +63,8 @@ struct Args {
     v1: String,
     #[clap(short('r'), long, help("v2 upper bound"))]
     v2: String,
+    #[clap(short('e'), long, help("whether to evaluate"))]
+    eval: Option<bool>,
 }
 
 fn main() -> Result<()> {
@@ -70,10 +72,23 @@ fn main() -> Result<()> {
 
     let filename = args.file_name;
     let filter_col_idx = args.filter_col_idx;
-    let v1 = args.v1;
-    let v2 = args.v2;
+    let v1: std::string::String = args.v1;
+    let v2: std::string::String = args.v2;
+    let eval: bool = match &args.eval {
+        Some(e) => *e,
+        None => false,
+    };
     let batch_size: usize = 1024;
+    let v1d: f64 = match v1.parse::<f64>() {
+        Ok(v) => v,
+        Err(_) => 0.0,
+    };
+    let v2d: f64 = match v2.parse::<f64>() {
+        Ok(v) => v,
+        Err(_) => 0.0,
+    };
 
+    let mut select_vec: Vec<bool> = vec![false; batch_size];
     let mut values_i64: Vec<i64> = vec![0; batch_size];
     let mut values_str: Vec<ByteArray> = vec![ByteArray::new(); batch_size];
     let start = SystemTime::now();
@@ -214,6 +229,17 @@ fn main() -> Result<()> {
                         ) {
                             Ok((_, 0)) => break,
                             Ok((_, rec)) => {
+                                if eval {
+                                    for i in 0..rec {
+                                        if values_i64[i] >= v1.parse::<i64>().unwrap()
+                                            && values_i64[i] <= v2.parse::<i64>().unwrap()
+                                        {
+                                            select_vec[i] = true;
+                                        } else {
+                                            select_vec[i] = false;
+                                        }
+                                    }
+                                }
                                 read_records += rec;
                                 total_decoded += rec;
                             }
@@ -269,6 +295,17 @@ fn main() -> Result<()> {
                         ) {
                             Ok((_, 0)) => break,
                             Ok((_, rec)) => {
+                                if eval {
+                                    for i in 0..rec {
+                                        if values_double[i] >= v1d
+                                            && values_double[i] <= v2d
+                                        {
+                                            select_vec[i] = true;
+                                        } else {
+                                            select_vec[i] = false;
+                                        }
+                                    }
+                                }
                                 read_records += rec;
                                 total_decoded += rec;
                             }
@@ -324,6 +361,16 @@ fn main() -> Result<()> {
                         ) {
                             Ok((_, 0)) => break,
                             Ok((_, rec)) => {
+                                if eval {
+                                    for i in 0..rec {
+                                        let s = values_str[i].as_utf8().unwrap();
+                                        if s >= v1.as_str() && s <= v2.as_str() {
+                                            select_vec[i] = true;
+                                        } else {
+                                            select_vec[i] = false;
+                                        }
+                                    }
+                                }
                                 read_records += rec;
                                 total_decoded += rec;
                             }
