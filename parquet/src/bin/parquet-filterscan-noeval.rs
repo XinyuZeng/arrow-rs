@@ -363,8 +363,9 @@ fn main() -> Result<()> {
                             Ok((_, rec)) => {
                                 if eval {
                                     for i in 0..rec {
-                                        let s = values_str[i].as_utf8().unwrap();
-                                        if s >= v1.as_str() && s <= v2.as_str() {
+                                        // let s = values_str[i].as_utf8().unwrap();
+                                        let s = values_str[i].data();
+                                        if s >= v1.as_bytes() && s <= v2.as_bytes() {
                                             select_vec[i] = true;
                                         } else {
                                             select_vec[i] = false;
