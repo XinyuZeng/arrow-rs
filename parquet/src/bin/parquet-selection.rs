@@ -387,6 +387,12 @@ fn main() -> Result<()> {
         "[IO] io-in: {} bytes, io-out: {} bytes",
         io_stat.read_bytes, io_stat.write_bytes
     );
+    let mut buf = String::new();
+    File::open("/proc/self/io")
+        .unwrap()
+        .read_to_string(&mut buf)
+        .unwrap();
+    println!("{}", buf);
     Ok(())
 }
 
