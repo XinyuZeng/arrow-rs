@@ -568,7 +568,11 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
     /// anticipated encoded size.
     #[cfg(feature = "arrow")]
     pub(crate) fn get_estimated_total_bytes(&self) -> u64 {
-        self.column_metrics.total_bytes_written
+        self.data_pages
+            .iter()
+            .map(|page| page.data().len() as u64)
+            .sum::<u64>()
+            + self.column_metrics.total_bytes_written
             + self.encoder.estimated_data_page_size() as u64
             + self.encoder.estimated_dict_page_size().unwrap_or_default() as u64
     }
